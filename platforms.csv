@@ -1,0 +1,5 @@
+PlatformNo,TrackServed,PrimaryUse
+PF_1,UP_SLOW,"For UP Slow locals (towards Churchgate)"
+PF_2,UP_FAST,"For UP Fast locals & Express (towards Churchgate)"
+PF_3,DN_FAST,"For DN Fast locals & Express (towards Borivali)"
+PF_4,DN_SLOW,"For DN Slow locals & Terminating trains"

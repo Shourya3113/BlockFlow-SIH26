@@ -1,0 +1,7 @@
+TrainNo,TrainType,Priority,MaxSpeedKmph,Notes
+BVI94012,Fast Local,2,100,"DN Train: Churchgate to Borivali"
+VR93011,Slow Local,3,85,"UP Train: Virar to Churchgate"
+AC001,AC Local,2,100,"UP Train: Borivali to Churchgate (Fast)"
+ST22471,Long-Distance Exp,1,110,"DN Train: Surat Express (passes through)"
+DDR84,Slow Local,3,85,"DN Train: Churchgate to Dadar (Terminating)"
+BVI96024,Slow Local,3,85,"DN Train: Churchgate to Borivali"

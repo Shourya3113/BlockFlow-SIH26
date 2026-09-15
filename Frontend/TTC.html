@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrainFlow Operator Dashboard - Dadar Station</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #1d1d1f; /* Apple-style dark gray */
+            color: #f5f5f7; /* Apple-style light text */
+            overflow: hidden;
+        }
+        .font-mono {
+            font-family: 'Roboto Mono', monospace;
+        }
+        .header {
+            background-color: rgba(28, 28, 30, 0.7);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+        }
+        .glass-panel {
+            background-color: rgba(44, 44, 46, 0.6);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 1.5rem; /* More pronounced rounding */
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.2);
+        }
+        .map-container {
+            background-color: #2c2c2e;
+            border: 1px solid #3a3a3c;
+            position: relative;
+            overflow: hidden;
+            border-radius: 1.5rem;
+        }
+        .track {
+            position: absolute;
+            width: 100%;
+            height: 4px;
+            background-color: #4a4a4e;
+        }
+        .track::before {
+            content: '';
+            position: absolute;
+            top: -3px;
+            left: 0;
+            right: 0;
+            height: 10px;
+            background-image: repeating-linear-gradient(to right, #5a5a5e 0, #5a5a5e 2px, transparent 2px, transparent 10px);
+        }
+        .platform {
+            position: absolute;
+            background-color: #3a3a3c;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            color: #e5e5e7;
+            font-weight: bold;
+            border: 1px solid #545458;
+        }
+        .train {
+            position: absolute;
+            width: 60px;
+            height: 18px;
+            border-radius: 6px; /* Slightly more rounded */
+            cursor: pointer;
+            transition: left 0.5s linear, background-color 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 10px;
+            font-weight: bold;
+            z-index: 10;
+            border: 1px solid rgba(0,0,0,0.2);
+        }
+        .train-moving { background-color: #30d158; color: #000; }
+        .train-alert { background-color: #ff9f0a; color: #000; animation: pulse 1.5s infinite; }
+        .train-stopped { background-color: #ff453a; color: #fff; }
+
+        .signal {
+            position: absolute;
+            width: 12px;
+            height: 24px;
+            background-color: #5a5a5e;
+            border-radius: 4px;
+            padding: 2px;
+            z-index: 20;
+        }
+        .signal-light {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin: 1px auto;
+        }
+        .light-green { background-color: #30d158; box-shadow: 0 0 8px #30d158; }
+        .light-red { background-color: #ff453a; box-shadow: 0 0 8px #ff453a; }
+        
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+        }
+        .suggestion-card { animation: fadeIn 0.5s ease-out; }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body class="h-screen flex flex-col">
+
+    <!-- Header -->
+    <header class="header flex-shrink-0">
+        <div class="container mx-auto px-6 py-4 flex justify-between items-center">
+            <h1 class="text-xl font-bold">Train<span class="text-blue-500">Flow</span></h1>
+            <div class="flex items-center space-x-6">
+                <div class="flex items-center space-x-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-yellow-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
+                    <span id="temperature" class="text-sm font-semibold text-gray-300">29°C</span>
+                </div>
+                <div class="font-mono text-lg text-gray-300" id="system-time"></div>
+                <div class="flex items-center space-x-2">
+                    <div class="w-3 h-3 rounded-full bg-green-500 animate-pulse"></div>
+                    <span class="text-sm text-gray-400 font-semibold">SYSTEM OPERATIONAL</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="flex-grow flex p-6 gap-6 overflow-hidden">
+        
+        <!-- Left Panel: Live Map -->
+        <div class="flex-grow w-2/3 flex flex-col">
+            <div class="flex justify-between items-center mb-2 px-4">
+                <h2 class="text-lg font-semibold text-gray-200">Live Network Map: Dadar WR Section</h2>
+            </div>
+            <div id="map" class="map-container flex-grow p-4">
+                <div class="absolute top-2 left-4 text-xs text-gray-400 font-medium">&#9664; Towards Borivali</div>
+                <div class="absolute top-2 right-4 text-xs text-gray-400 font-medium">Towards Churchgate &#9654;</div>
+                <!-- Dadar Station model will be dynamically generated here -->
+            </div>
+        </div>
+
+        <!-- Right Panel: Controls & Information -->
+        <div class="flex-shrink-0 w-1/3 flex flex-col gap-6">
+            
+            <!-- AI Suggestion Panel -->
+            <div class="glass-panel p-6 flex flex-col h-1/3">
+                <h3 class="text-blue-500 font-bold mb-2 text-lg flex items-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
+                    AI SUGGESTION
+                </h3>
+                <div id="suggestion-box" class="flex-grow flex items-center justify-center">
+                    <p class="text-gray-500">No active suggestions.</p>
+                </div>
+            </div>
+
+            <!-- Train Status & System Log Panels -->
+            <div class="glass-panel p-6 flex flex-col h-2/3 overflow-hidden">
+                <div class="flex-grow flex flex-col h-3/5 overflow-hidden">
+                    <h3 class="font-semibold mb-2 text-gray-200">Train Status</h3>
+                    <div class="flex-grow overflow-y-auto pr-2">
+                        <table class="w-full text-sm text-left">
+                            <thead class="text-xs text-gray-500 uppercase">
+                                <tr><th class="py-2 px-2">ID</th><th class="py-2 px-2">Status</th><th class="py-2 px-2">Prio.</th><th class="py-2 px-2">Platform</th></tr>
+                            </thead>
+                            <tbody id="train-list" class="divide-y divide-gray-700"></tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="border-t border-gray-700/50 my-4"></div>
+                <div class="flex-grow flex flex-col h-2/5 overflow-hidden">
+                    <h3 class="font-semibold mb-2 text-gray-200">System Log</h3>
+                    <div id="log-container" class="flex-grow overflow-y-auto font-mono text-xs space-y-1 pr-2"></div>
+                </div>
+            </div>
+
+        </div>
+    </main>
+    
+    <script>
+        const systemTimeEl = document.getElementById('system-time');
+        const mapEl = document.getElementById('map');
+        const suggestionBoxEl = document.getElementById('suggestion-box');
+        const trainListEl = document.getElementById('train-list');
+        const logContainerEl = document.getElementById('log-container');
+
+        // --- Dadar Station Model (Horizontal Layout - 6 Track Revision) ---
+        const layout = {
+            platforms: [
+                { id: "1", x: 10, width: 80, height: 8, y: 85 },
+                { id: "2/3", x: 10, width: 80, height: 8, y: 60 },
+                { id: "4", x: 10, width: 80, height: 8, y: 37 },
+                { id: "5", x: 10, width: 80, height: 8, y: 14 },
+            ],
+            tracks: [
+                { id: 'T1', y: 83, platforms: [1] },
+                { id: 'T2', y: 70, platforms: [2] },
+                { id: 'T3', y: 58, platforms: [3] },
+                { id: 'T4', y: 47, platforms: [4] },
+                { id: 'T5', y: 35, platforms: [4] },
+                { id: 'T6', y: 24, platforms: [5] },
+            ]
+        };
+
+        // --- Simulation State ---
+        let simulationSpeed = 2.0;
+        let trains = [
+            { id: 'LCL-1', priority: 3, trackId: 'T1', position: 5, speed: 45, status: 'Moving', dir: 1, hasConflict: false, stopDetails: { platformId: '1', duration: 5000, isStopped: false, timer: 0, originalSpeed: 45, completed: false } },
+            { id: 'FST-1', priority: 2, trackId: 'T3', position: 95, speed: 75, status: 'Moving', dir: -1, hasConflict: false, stopDetails: { platformId: '2/3', duration: 3000, isStopped: false, timer: 0, originalSpeed: 75, completed: false } },
+            { id: 'EXP-1', priority: 1, trackId: 'T5', position: 10, speed: 100, status: 'Moving', dir: 1, hasConflict: false, stopDetails: null },
+            { id: 'CRG-1', priority: 4, trackId: 'T6', position: 20, speed: 30, status: 'Moving', dir: 1, hasConflict: false, stopDetails: null }
+        ];
+
+        const signals = [
+            { id: 'S1', trackId: 'T1', position: 95, state: 'green' }, { id: 'S2', trackId: 'T2', position: 5, state: 'green' },
+            { id: 'S3', trackId: 'T3', position: 95, state: 'red' }, { id: 'S4', trackId: 'T4', position: 5, state: 'green' },
+            { id: 'S5', trackId: 'T5', position: 95, state: 'green' }, { id: 'S6', trackId: 'T6', position: 5, state: 'green' },
+        ];
+        
+        let activeSuggestion = null;
+
+        function addLog(message, type = 'INFO') {
+            const timestamp = new Date().toLocaleTimeString();
+            let color = 'text-gray-400';
+            if (type === 'AI') color = 'text-blue-400 font-semibold';
+            if (type === 'ACTION') color = 'text-green-400 font-semibold';
+            logContainerEl.innerHTML += `<div><span class="text-gray-500">[${timestamp}]</span> <span class="${color}">[${type}]</span> ${message}</div>`;
+            logContainerEl.scrollTop = logContainerEl.scrollHeight;
+        }
+
+        function renderMap() {
+            mapEl.innerHTML = '<div class="absolute top-2 left-4 text-xs text-gray-400 font-medium">&#9664; Towards Borivali</div><div class="absolute top-2 right-4 text-xs text-gray-400 font-medium">Towards Churchgate &#9654;</div>';
+            // Render Tracks & Platforms
+            layout.tracks.forEach(track => {
+                const trackEl = document.createElement('div');
+                trackEl.className = 'track';
+                trackEl.style.top = `${track.y}%`;
+                mapEl.appendChild(trackEl);
+            });
+            layout.platforms.forEach(p => {
+                const platEl = document.createElement('div');
+                platEl.className = 'platform';
+                platEl.style.left = `${p.x}%`; platEl.style.top = `${p.y}%`;
+                platEl.style.height = `${p.height}%`; platEl.style.width = `${p.width}%`;
+                platEl.innerText = p.id; mapEl.appendChild(platEl);
+            });
+            // Render Signals
+            signals.forEach(signal => {
+                 const track = layout.tracks.find(t => t.id === signal.trackId);
+                 const signalEl = document.createElement('div');
+                 signalEl.className = 'signal';
+                 signalEl.style.left = `calc(${signal.position}% - 6px)`;
+                 signalEl.style.top = `calc(${track.y}% - 25px)`;
+                 signalEl.innerHTML = `<div class="signal-light ${signal.state === 'green' ? 'light-green' : 'light-red'}"></div>`;
+                 mapEl.appendChild(signalEl);
+            });
+            // Render Trains
+            trains.forEach(train => {
+                const track = layout.tracks.find(t => t.id === train.trackId);
+                let trainEl = document.getElementById(`train-${train.id}`);
+                if (!trainEl) {
+                    trainEl = document.createElement('div');
+                    trainEl.id = `train-${train.id}`;
+                    trainEl.textContent = train.id;
+                    mapEl.appendChild(trainEl);
+                }
+                trainEl.style.left = `calc(${train.position}% - 30px)`;
+                trainEl.style.top = `calc(${track.y}% - 7px)`;
+                
+                let statusClass = train.status === 'Moving' ? 'train-moving' : 'train-stopped';
+                if(train.hasConflict) statusClass = 'train-alert';
+                trainEl.className = `train ${statusClass}`;
+            });
+        }
+        
+        function getPriorityText(priority) {
+            switch (priority) {
+                case 1: return { text: 'High', color: 'text-red-400' };
+                case 2: return { text: 'Medium', color: 'text-yellow-400' };
+                case 3: return { text: 'Low', color: 'text-green-400' };
+                case 4: return { text: 'Cargo', color: 'text-gray-400' };
+                default: return { text: 'N/A', color: 'text-gray-400' };
+            }
+        }
+
+        function renderTrainList() {
+            trainListEl.innerHTML = '';
+            trains.forEach(train => {
+                const row = document.createElement('tr');
+                let statusColor = 'text-gray-300';
+                if (train.status === 'Moving') statusColor = 'text-green-400';
+                if (train.status === 'Stopped') statusColor = 'text-red-400';
+                const platformText = train.stopDetails ? `P${train.stopDetails.platformId}` : 'THRU';
+                const priorityInfo = getPriorityText(train.priority);
+                
+                row.innerHTML = `
+                    <td class="py-2 px-2 font-bold text-gray-200">${train.id}</td>
+                    <td class="py-2 px-2 font-semibold ${statusColor}">${train.status}</td>
+                    <td class="py-2 px-2 font-bold ${priorityInfo.color}">${priorityInfo.text}</td>
+                    <td class="py-2 px-2 text-gray-300">${platformText}</td>
+                `;
+                trainListEl.appendChild(row);
+            });
+        }
+
+        function renderSuggestion() {
+            if (activeSuggestion) {
+                if (!suggestionBoxEl.querySelector('.suggestion-card')) {
+                    suggestionBoxEl.innerHTML = `<div class="suggestion-card text-center w-full"><p class="text-lg text-gray-200">${activeSuggestion.text}</p><div class="mt-4 space-x-4"><button onclick="handleAccept()" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-6 rounded-full">Accept</button><button onclick="handleOverride()" class="bg-gray-600 hover:bg-gray-500 text-white font-bold py-2 px-6 rounded-full">Override</button></div></div>`;
+                }
+            } else {
+                if (suggestionBoxEl.querySelector('.suggestion-card')) {
+                    suggestionBoxEl.innerHTML = `<p class="text-gray-500">No active suggestions.</p>`;
+                }
+            }
+        }
+
+        function handleAccept() {
+            if (!activeSuggestion) return;
+            addLog(`Controller ACCEPTED: ${activeSuggestion.log}`, 'ACTION');
+            activeSuggestion.action();
+            if (activeSuggestion.conflictingTrain) {
+                const otherTrain = trains.find(t => t.id === activeSuggestion.conflictingTrain.id);
+                if(otherTrain) otherTrain.hasConflict = false;
+            }
+            activeSuggestion.train.hasConflict = false;
+            activeSuggestion = null;
+            renderSuggestion();
+        }
+
+        function handleOverride() {
+            if (!activeSuggestion) return;
+            addLog(`Controller OVERRODE: ${activeSuggestion.log}. AI learning...`, 'ACTION');
+            if (activeSuggestion.conflictingTrain) {
+                const otherTrain = trains.find(t => t.id === activeSuggestion.conflictingTrain.id);
+                if(otherTrain) otherTrain.hasConflict = false;
+            }
+            activeSuggestion.train.hasConflict = false;
+            activeSuggestion = null;
+            renderSuggestion();
+        }
+
+        function updateTrainPositions() {
+            const gameTick = 500 / simulationSpeed;
+            trains.forEach(train => {
+                if (train.stopDetails && train.stopDetails.isStopped) {
+                    train.stopDetails.timer -= gameTick;
+                    if (train.stopDetails.timer <= 0) {
+                        train.stopDetails.isStopped = false;
+                        train.stopDetails.completed = true;
+                        train.status = 'Moving';
+                        train.speed = train.stopDetails.originalSpeed;
+                        addLog(`Train ${train.id} departing from platform ${train.stopDetails.platformId}.`);
+                    }
+                    return; 
+                }
+
+                if (train.status === 'Moving') {
+                    if (train.stopDetails && !train.stopDetails.isStopped && !train.stopDetails.completed) {
+                        const platform = layout.platforms.find(p => p.id === train.stopDetails.platformId);
+                        const platformCenter = platform.x + platform.width / 2;
+                        if (Math.abs(train.position - platformCenter) < 2) {
+                            train.status = 'Stopped';
+                            train.speed = 0;
+                            train.stopDetails.isStopped = true;
+                            train.stopDetails.timer = train.stopDetails.duration;
+                            addLog(`Train ${train.id} stopping at P${train.stopDetails.platformId} for ${train.stopDetails.duration / 1000}s.`);
+                            return;
+                        }
+                    }
+
+                    const signal = signals.find(s => s.trackId === train.trackId && (train.dir > 0 ? s.position > 50 : s.position < 50));
+                    if(signal && signal.state === 'red'){
+                        const stopPosition = signal.position + (train.dir > 0 ? -5 : 5);
+                        if((train.dir > 0 && train.position >= stopPosition) || (train.dir < 0 && train.position <= stopPosition)){
+                            train.speed = 0;
+                            train.status = 'Stopped';
+                            addLog(`Train ${train.id} stopped at red signal ${signal.id}.`);
+                            return;
+                        }
+                    }
+                    train.position += (train.speed / 1000) * simulationSpeed * train.dir;
+                    if (train.position > 100 || train.position < 0) {
+                        train.position = train.dir > 0 ? 0 : 100;
+                        if (train.stopDetails) {
+                            train.stopDetails.completed = false;
+                        }
+                    }
+                }
+            });
+        }
+        
+        function checkForConflicts() {
+            if (activeSuggestion) return;
+            
+            // Conflict 1: LCL-1 vs FST-1
+            const train1 = trains.find(t => t.id === 'LCL-1');
+            const train2 = trains.find(t => t.id === 'FST-1');
+
+            if (train1 && train2 && !train1.hasConflict && !train2.hasConflict) {
+                 if (train1.stopDetails && !train1.stopDetails.isStopped && train1.position > 55 && train2.position < 40) {
+                    const highPriorityTrain = train1.priority < train2.priority ? train1 : train2;
+                    const lowPriorityTrain = train1.priority > train2.priority ? train1 : train2;
+                    lowPriorityTrain.hasConflict = true;
+                    highPriorityTrain.hasConflict = true;
+                    activeSuggestion = {
+                        train: lowPriorityTrain, conflictingTrain: highPriorityTrain,
+                        text: `Priority Conflict! Hold ${lowPriorityTrain.id} for ${highPriorityTrain.id}.`,
+                        log: `Hold ${lowPriorityTrain.id} for priority passing of ${highPriorityTrain.id}`,
+                        action: () => {
+                            addLog(`Executing: Delaying ${lowPriorityTrain.id} departure.`, 'AI');
+                            lowPriorityTrain.status = 'Stopped'; lowPriorityTrain.speed = 0;
+                            setTimeout(() => {
+                                lowPriorityTrain.status = 'Moving';
+                                if(lowPriorityTrain.stopDetails) lowPriorityTrain.speed = lowPriorityTrain.stopDetails.originalSpeed;
+                                else lowPriorityTrain.speed = 45; 
+                                addLog(`Resuming ${lowPriorityTrain.id}. Conflict cleared.`, 'AI');
+                            }, 4000 / simulationSpeed);
+                        }
+                    };
+                    addLog(`AI predicts priority conflict. Recommending action.`, 'AI');
+                    return; // Handle one conflict at a time
+                 }
+            }
+
+            // Conflict 2: EXP-1 vs CRG-1
+            const expressTrain = trains.find(t => t.id === 'EXP-1');
+            const cargoTrain = trains.find(t => t.id === 'CRG-1');
+
+            if (expressTrain && cargoTrain && !expressTrain.hasConflict && !cargoTrain.hasConflict) {
+                if (expressTrain.dir === cargoTrain.dir && expressTrain.position < cargoTrain.position && (cargoTrain.position - expressTrain.position < 30) ) {
+                    const highPriorityTrain = expressTrain;
+                    const lowPriorityTrain = cargoTrain;
+                    lowPriorityTrain.hasConflict = true;
+                    highPriorityTrain.hasConflict = true;
+                    activeSuggestion = {
+                        train: lowPriorityTrain, conflictingTrain: highPriorityTrain,
+                        text: `Overtake Alert! Hold ${lowPriorityTrain.id} for high-priority ${highPriorityTrain.id}.`,
+                        log: `Hold ${lowPriorityTrain.id} for priority passing of ${highPriorityTrain.id}`,
+                        action: () => {
+                            addLog(`Executing: Holding ${lowPriorityTrain.id} on a siding.`, 'AI');
+                            lowPriorityTrain.status = 'Stopped'; lowPriorityTrain.speed = 0;
+                            setTimeout(() => {
+                                lowPriorityTrain.status = 'Moving'; lowPriorityTrain.speed = 30;
+                                addLog(`Resuming ${lowPriorityTrain.id}. Overtake complete.`, 'AI');
+                            }, 8000 / simulationSpeed);
+                        }
+                    };
+                    addLog(`AI predicts overtake conflict. Recommending action.`, 'AI');
+                }
+            }
+        }
+
+        function updateClock() {
+            systemTimeEl.textContent = new Date().toLocaleTimeString('en-GB');
+        }
+
+        function renderAll() {
+            renderMap();
+            renderTrainList();
+            renderSuggestion();
+        }
+
+        function gameLoop() {
+            updateTrainPositions();
+            checkForConflicts();
+            renderAll();
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            addLog('TrainFlow Dashboard Initialized. Monitoring Dadar WR Section...');
+            renderAll();
+            setInterval(updateClock, 1000);
+            setInterval(gameLoop, 500 / simulationSpeed);
+        });
+    </script>
+</body>
+</html>
+
