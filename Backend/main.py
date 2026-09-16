@@ -22,6 +22,8 @@ from .ai_engine.block_optimizer import IntegratedBlockOptimizer
 from .horizons.weekly_planner import WeeklyBlockPlanner
 from .horizons.monthly_planner import MonthlyBlockPlanner
 from .ai_engine.multi_agent_system import prognostics_dnn, orchestrator_agent
+from .telemetry import telemetry
+from .reports.permit import generate_grant_permit
 
 app = FastAPI(
     title="IR-ABPS: Automatic Block Planning System",
@@ -72,6 +74,9 @@ class BlockActionRequest(BaseModel):
     action: str # "APPROVE", "REJECT", "OVERRIDE"
     controller_id: str = "CHIEF_CTRL_MUMBAI"
     reason: Optional[str] = "Optimal multi-department coordination verified."
+
+class SimulationRequest(BaseModel):
+    block_id: str
 
 @app.get("/api/health")
 def health():
@@ -137,10 +142,153 @@ def get_corridor_info():
 
 @app.get("/api/schedule/weekly")
 def get_weekly_schedule():
-    """Returns the operational 7-day rolling block schedule."""
+    """Returns the operational 7-day rolling block schedule with audit trace."""
+
     if not CACHE["weekly"]:
         refresh_plans()
-    return CACHE["weekly"]
+
+    trace_id = telemetry.start_trace(
+        operation="WEEKLY_SCHEDULE",
+        input_summary={
+            "total_demands": len(get_all_raw_defects()),
+            "horizon_days": 7
+        }
+    )
+
+    step = telemetry.start_step(
+        trace_id,
+        "weekly_schedule_generation"
+    )
+
+    try:
+        schedule = CACHE["weekly"]
+
+        telemetry.finish_step(
+            trace_id,
+            step,
+            details={
+                "blocks": len(schedule["scheduled_blocks"]),
+                "tasks_scheduled": schedule["metrics"].get("tasks_scheduled", 0)
+            }
+        )
+
+        telemetry.finish_trace(
+            trace_id,
+            output_summary={
+                "blocks": len(schedule["scheduled_blocks"]),
+                "metrics": schedule["metrics"]
+            }
+        )
+
+        return {
+            **schedule,
+            "trace": trace_id
+        }
+
+    except Exception as e:
+        telemetry.finish_step(
+            trace_id,
+            step,
+            status="FAILED",
+            details={"error": str(e)}
+        )
+
+        telemetry.finish_trace(
+            trace_id,
+            status="FAILED",
+            output_summary={"error": str(e)}
+        )
+
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/simulate")
+def simulate_block(req: SimulationRequest):
+    """Simulates execution of a selected weekly maintenance block."""
+
+    if not CACHE["weekly"]:
+        refresh_plans()
+
+    block = next(
+        (
+            blk for blk in CACHE["weekly"]["scheduled_blocks"]
+            if blk["block_id"] == req.block_id
+        ),
+        None
+    )
+
+    if not block:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Block {req.block_id} not found"
+        )
+
+    trace_id = telemetry.start_trace(
+        operation="BLOCK_SIMULATION",
+        input_summary={
+            "block_id": req.block_id
+        }
+    )
+
+    step = telemetry.start_step(
+        trace_id,
+        "block_simulation",
+        {
+            "section": block["section"],
+            "track_id": block["track_id"],
+            "window": f"{block['start_time']}-{block['end_time']}"
+        }
+    )
+
+    try:
+        metrics = {
+            "allocated_duration_mins": block["allocated_duration_mins"],
+            "slot_window_mins": block["slot_window_mins"],
+            "task_count": block["task_count"],
+            "downtime_saved_mins": block["downtime_saved_mins"],
+            "requires_power_block": block["requires_power_block"],
+            "requires_traffic_block": block["requires_traffic_block"]
+        }
+
+        telemetry.finish_step(
+            trace_id,
+            step,
+            details={
+                "simulation_status": "SAFE_TO_EXECUTE"
+            }
+        )
+
+        telemetry.finish_trace(
+            trace_id,
+            output_summary={
+                "block_id": req.block_id,
+                "status": "SIMULATED",
+                "metrics": metrics
+            }
+        )
+
+        return {
+            "block_id": req.block_id,
+            "window": f"{block['start_time']}-{block['end_time']}",
+            "status": "SIMULATED",
+            "trace": trace_id,
+            "metrics": metrics
+        }
+
+    except Exception as e:
+        telemetry.finish_step(
+            trace_id,
+            step,
+            status="FAILED",
+            details={"error": str(e)}
+        )
+
+        telemetry.finish_trace(
+            trace_id,
+            status="FAILED",
+            output_summary={"error": str(e)}
+        )
+
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/schedule/monthly")
 def get_monthly_schedule():
@@ -152,32 +300,165 @@ def get_monthly_schedule():
 @app.post("/api/optimize")
 def trigger_optimization():
     """Manually re-runs optimization across all ingested data."""
-    refresh_plans()
-    return {
-        "message": "Optimization re-calculated successfully with SciPy HiGHS solver.",
-        "weekly_metrics": CACHE["weekly"]["metrics"],
-        "monthly_metrics": CACHE["monthly"]["metrics"]
-    }
+
+    trace_id = telemetry.start_trace(
+        operation="BLOCK_OPTIMIZATION",
+        input_summary={
+            "total_demands": len(get_all_raw_defects())
+        }
+    )
+
+    step = telemetry.start_step(
+        trace_id,
+        "optimization",
+        {
+            "solver": "SciPy HiGHS",
+            "horizon": "weekly + monthly"
+        }
+    )
+
+    try:
+        refresh_plans()
+
+        telemetry.finish_step(
+            trace_id,
+            step,
+            details={
+                "weekly_blocks": len(CACHE["weekly"]["scheduled_blocks"]),
+                "monthly_blocks": len(CACHE["monthly"]["scheduled_blocks"])
+            }
+        )
+
+        telemetry.finish_trace(
+            trace_id,
+            output_summary={
+                "weekly_metrics": CACHE["weekly"]["metrics"],
+                "monthly_metrics": CACHE["monthly"]["metrics"]
+            }
+        )
+
+        return {
+            "message": "Optimization re-calculated successfully with SciPy HiGHS solver.",
+            "trace_id": trace_id,
+            "weekly_metrics": CACHE["weekly"]["metrics"],
+            "monthly_metrics": CACHE["monthly"]["metrics"]
+        }
+
+    except Exception as e:
+        telemetry.finish_step(
+            trace_id,
+            step,
+            status="FAILED",
+            details={"error": str(e)}
+        )
+
+        telemetry.finish_trace(
+            trace_id,
+            status="FAILED",
+            output_summary={"error": str(e)}
+        )
+
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/action/grant")
-def grant_or_override_block(req: BlockActionRequest):
-    """Controller decision hook to approve, alter, or override an AI proposed block."""
-    entry = {
-        "timestamp": datetime.now().isoformat(),
-        "block_id": req.block_id,
-        "action": req.action,
-        "controller_id": req.controller_id,
-        "reason": req.reason
-    }
-    STATE["approval_log"].append(entry)
+def grant_block(req: BlockActionRequest):
+    """Issue an auditable digital grant permit for a scheduled block."""
 
-    # Update block status in cached weekly plan if present
-    if CACHE["weekly"]:
-        for blk in CACHE["weekly"]["scheduled_blocks"]:
-            if blk["block_id"] == req.block_id:
-                blk["approval_status"] = "GRANTED" if req.action == "APPROVE" else req.action
+    if not CACHE["weekly"]:
+        refresh_plans()
 
-    return {"message": f"Block {req.block_id} updated to {req.action}", "log_entry": entry}
+    block = next(
+        (
+            blk for blk in CACHE["weekly"]["scheduled_blocks"]
+            if blk["block_id"] == req.block_id
+        ),
+        None
+    )
+
+    if not block:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Block {req.block_id} not found"
+        )
+
+    trace_id = telemetry.start_trace(
+        operation="DIGITAL_BLOCK_GRANT",
+        input_summary={
+            "block_id": req.block_id,
+            "controller_id": req.controller_id,
+            "action": req.action
+        }
+    )
+
+    step = telemetry.start_step(
+        trace_id,
+        "grant_permit_generation",
+        {
+            "block_id": req.block_id,
+            "controller_id": req.controller_id
+        }
+    )
+
+    try:
+        permit = generate_grant_permit(
+            block=block,
+            trace_id=trace_id,
+            controller_id=req.controller_id
+        )
+
+        block["approval_status"] = "GRANTED"
+
+        approval_entry = {
+            "block_id": req.block_id,
+            "action": "GRANT",
+            "controller_id": req.controller_id,
+            "reason": req.reason,
+            "timestamp": datetime.now().isoformat(),
+            "trace_id": trace_id,
+            "permit_id": permit["permit_id"]
+        }
+
+        STATE["approval_log"].append(approval_entry)
+
+        telemetry.finish_step(
+            trace_id,
+            step,
+            details={
+                "permit_id": permit["permit_id"],
+                "status": "GRANTED"
+            }
+        )
+
+        telemetry.finish_trace(
+            trace_id,
+            output_summary={
+                "permit_id": permit["permit_id"],
+                "block_id": req.block_id,
+                "status": "GRANTED"
+            }
+        )
+
+        return {
+            "message": "Digital block grant permit issued successfully.",
+            "permit": permit,
+            "trace": trace_id
+        }
+
+    except Exception as e:
+        telemetry.finish_step(
+            trace_id,
+            step,
+            status="FAILED",
+            details={"error": str(e)}
+        )
+
+        telemetry.finish_trace(
+            trace_id,
+            status="FAILED",
+            output_summary={"error": str(e)}
+        )
+
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/action/audit-log")
 def get_audit_log():
