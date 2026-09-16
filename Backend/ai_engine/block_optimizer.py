@@ -280,7 +280,16 @@ class IntegratedBlockOptimizer:
                             "downtime_saved_mins": block["saved_mins"],
                             "traffic_impact": traffic_info,
                             "approval_status": "PROPOSED",
-                            "ai_confidence_pct": round(92.0 + np.random.uniform(2.0, 7.0), 1)
+                            "ai_confidence_pct": round(
+                                min(
+                                    99.0,
+                                    88.0
+                                    + (block["max_aci_score"] * 0.08)
+                                    + (5.0 if block["is_joint_block"] else 0.0)
+                                    + (3.0 if block["duration_mins"] <= slot["duration_mins"] else 0.0)
+                                ),
+                                1
+                            )
                         }
                         scheduled_blocks.append(block_record)
 
