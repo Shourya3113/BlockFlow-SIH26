@@ -108,7 +108,36 @@ def generate_smms_defects(count: int = 20, seed: int = 43) -> List[Dict[str, Any
 
     return items
 
+# --------------------------------------------------------------------------- #
+#  CRIS SMMS ingestion entry points
+# --------------------------------------------------------------------------- #
+def parse_smms_payload(payload, scorer=None):
+    """
+    Ingest a raw CRIS **SMMS** (Signal & Telecom) feed.
+
+    Point-machine disconnections carry ``DISCONNECTION: Y`` and a Form T/351
+    reference; the IRSEM Para 22 invariant is enforced downstream in
+    :mod:`Backend.data_ingestion.safety`.
+    """
+    from .pipeline import ingest_feed
+
+    return ingest_feed(payload, source="SMMS", scorer=scorer)
+
+
+def normalize_smms_defect(defect):
+    """Convert one synthetic/legacy SMMS defect dict into a BlockRequisition."""
+    from .pipeline import normalize_legacy_defect
+
+    return normalize_legacy_defect(defect, source="SMMS")
+
+
 if __name__ == "__main__":
     data = generate_smms_defects(10)
     print(f"Generated {len(data)} sample SMMS defects.")
     print("Sample record:", data[0])
+
+    requisition = normalize_smms_defect(data[0])
+    print(
+        f"Normalised      : {requisition.asset_id} [{requisition.dept.value}] "
+        f"km {requisition.km_start}-{requisition.km_end} on {requisition.line.value}"
+    )
