@@ -172,11 +172,13 @@ class AssetDegradationML:
         has_psr = 1 if item.get("psr_speed_kmph") else 0
         density = 160.0
 
-        feat = np.array([[gmt, age, temp, curve, days_maint, prior_flaws, has_psr, density]])
-        
+        feat = pd.DataFrame(
+            [[gmt, age, temp, curve, days_maint, prior_flaws, has_psr, density]],
+            columns=self.feature_names
+        )
+
         failure_prob = float(self.classifier.predict_proba(feat)[0, 1])
         predicted_delay = float(self.regressor.predict(feat)[0])
-
         return {
             "ml_failure_prob_7d": round(failure_prob, 3),
             "ml_predicted_delay_mins": round(predicted_delay, 1)
