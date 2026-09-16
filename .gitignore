@@ -4,3 +4,8 @@ __pycache__/
 *.log
 .DS_Store
 Thumbs.db
+
+# Local virtual environments (not shipped; see Backend/requirements.txt)
+.venv/
+venv/
+env/

@@ -1,0 +1,356 @@
+{
+  "feed_id": "STRESS-MALFORMED-001",
+  "description": "Malformed / hostile CRIS payload corpus used to prove the ingestion layer quarantines bad data instead of leaking it into the HiGHS simplex solver. Each case declares the outcome the contract must produce: REJECT (never reaches the optimizer) or ACCEPT_BUT_FLAGGED (syntactically valid, but the statutory safety invariant must catch it).",
+  "expected_contract": "[asset_id, dept, km_start, km_end, aci]",
+  "cases": [
+    {
+      "case_id": "KM_END_BEYOND_CORRIDOR",
+      "rule": "CORRIDOR_BOUNDARY",
+      "expect": "REJECT",
+      "why": "Virar is km 59.980; chainage 62.40 lies beyond the surveyed corridor.",
+      "payload": {
+        "REQUISITION_NO": "BAD-001",
+        "DIRECTORATE": "ENGINEERING",
+        "KM_FROM": "58.50",
+        "KM_TO": "62.40",
+        "TRACK": "UP_FAST",
+        "DURATION_MINS": "90",
+        "SEVERITY": "URGENT"
+      }
+    },
+    {
+      "case_id": "KM_START_NEGATIVE",
+      "rule": "CORRIDOR_BOUNDARY",
+      "expect": "REJECT",
+      "why": "Negative chainage - datum error in the CRIS export.",
+      "payload": {
+        "REQUISITION_NO": "BAD-002",
+        "DIRECTORATE": "ENGINEERING",
+        "KM_FROM": "-2.50",
+        "KM_TO": "1.20",
+        "TRACK": "DN_SLOW",
+        "DURATION_MINS": "60",
+        "SEVERITY": "ROUTINE"
+      }
+    },
+    {
+      "case_id": "INVERTED_CHAINAGE",
+      "rule": "CHAINAGE_ORDER",
+      "expect": "REJECT",
+      "why": "km_start 25.00 > km_end 18.00 - the possession would run backwards.",
+      "payload": {
+        "REQ_NO": "BAD-003",
+        "DEPT": "S&T",
+        "CHAINAGE_FROM": "25.00",
+        "CHAINAGE_TO": "18.00",
+        "RUNNING_LINE": "UP_FAST",
+        "MINUTES": "60",
+        "SEVERITY": "URGENT",
+        "DISCONNECTION": "Y"
+      }
+    },
+    {
+      "case_id": "SPAN_TOO_LONG",
+      "rule": "SINGLE_POSSESSION_SPAN",
+      "expect": "REJECT",
+      "why": "A 35 km single possession cannot be a legal block; must be split.",
+      "payload": {
+        "ASSET_ID": "BAD-004",
+        "WING": "TRD",
+        "CHAINAGE_FROM": "5.00",
+        "CHAINAGE_TO": "40.00",
+        "TRACK": "DN_FAST",
+        "DURATION": "120",
+        "PRIORITY": "HIGH"
+      }
+    },
+    {
+      "case_id": "UNKNOWN_DEPARTMENT",
+      "rule": "DEPT_ENUM",
+      "expect": "REJECT",
+      "why": "MECHANICAL is not one of the three directorates the optimizer schedules.",
+      "payload": {
+        "REQUISITION_NO": "BAD-005",
+        "DIRECTORATE": "MECHANICAL",
+        "KM_FROM": "12.00",
+        "KM_TO": "12.40",
+        "TRACK": "UP_SLOW",
+        "DURATION_MINS": "60"
+      }
+    },
+    {
+      "case_id": "UNKNOWN_RUNNING_LINE",
+      "rule": "LINE_ENUM",
+      "expect": "REJECT",
+      "why": "Corridor has 4 lines (UP/DN FAST/SLOW); DN_UP does not exist.",
+      "payload": {
+        "REQUISITION_NO": "BAD-006",
+        "DIRECTORATE": "ENGINEERING",
+        "KM_FROM": "12.00",
+        "KM_TO": "12.40",
+        "TRACK": "DN_UP",
+        "DURATION_MINS": "60"
+      }
+    },
+    {
+      "case_id": "ZERO_DURATION",
+      "rule": "POSSESSION_DURATION",
+      "expect": "REJECT",
+      "why": "Zero-minute possession is a data-entry stub, not a schedulable block.",
+      "payload": {
+        "REQUISITION_NO": "BAD-007",
+        "DIRECTORATE": "ENGINEERING",
+        "KM_FROM": "12.00",
+        "KM_TO": "12.40",
+        "TRACK": "UP_FAST",
+        "DURATION_MINS": "0"
+      }
+    },
+    {
+      "case_id": "UNPARSEABLE_DURATION",
+      "rule": "DURATION_ENCODING",
+      "expect": "REJECT",
+      "why": "Free-text duration from a scanned paper requisition.",
+      "payload": {
+        "REQ_NO": "BAD-008",
+        "DEPT": "S&T",
+        "CHAINAGE_FROM": "30.00",
+        "CHAINAGE_TO": "30.20",
+        "RUNNING_LINE": "DN_SLOW",
+        "MINUTES": "till the block is over"
+      }
+    },
+    {
+      "case_id": "URGENCY_OVER_480",
+      "rule": "POSSESSION_DURATION",
+      "expect": "REJECT",
+      "why": "A 9-hour possession exceeds the maximum single block window.",
+      "payload": {
+        "ASSET_ID": "BAD-009",
+        "WING": "TRD",
+        "CHAINAGE_FROM": "20.00",
+        "CHAINAGE_TO": "21.00",
+        "TRACK": "UP_FAST",
+        "DURATION": "540"
+      }
+    },
+    {
+      "case_id": "MISSING_ASSET_ID",
+      "rule": "ASSET_ID_REQUIRED",
+      "expect": "REJECT",
+      "why": "No requisition key - the asset cannot be traced back to a keeper.",
+      "payload": {
+        "DIRECTORATE": "ENGINEERING",
+        "KM_FROM": "15.00",
+        "KM_TO": "15.30",
+        "TRACK": "UP_SLOW",
+        "DURATION_MINS": "60"
+      }
+    },
+    {
+      "case_id": "EMPTY_ASSET_ID",
+      "rule": "ASSET_ID_REQUIRED",
+      "expect": "REJECT",
+      "why": "Whitespace-only asset id from a truncated CSV export.",
+      "payload": {
+        "REQUISITION_NO": "   ",
+        "DIRECTORATE": "ENGINEERING",
+        "KM_FROM": "15.00",
+        "KM_TO": "15.30",
+        "TRACK": "UP_SLOW",
+        "DURATION_MINS": "60"
+      }
+    },
+    {
+      "case_id": "ASSET_ID_ILLEGAL_CHARS",
+      "rule": "ASSET_ID_FORMAT",
+      "expect": "REJECT",
+      "why": "SQL-ish junk inside the requisition key must never be echoed downstream.",
+      "payload": {
+        "REQUISITION_NO": "'; DROP TABLE assets; --",
+        "DIRECTORATE": "ENGINEERING",
+        "KM_FROM": "15.00",
+        "KM_TO": "15.30",
+        "TRACK": "UP_SLOW",
+        "DURATION_MINS": "60"
+      }
+    },
+    {
+      "case_id": "NON_NUMERIC_CHAINAGE",
+      "rule": "CHAINAGE_NUMERIC",
+      "expect": "REJECT",
+      "why": "Chainage exported as a word instead of a number.",
+      "payload": {
+        "REQUISITION_NO": "BAD-013",
+        "DIRECTORATE": "ENGINEERING",
+        "KM_FROM": "twenty",
+        "KM_TO": "21.20",
+        "TRACK": "DN_FAST",
+        "DURATION_MINS": "120"
+      }
+    },
+    {
+      "case_id": "DEPARTMENT_MISSING",
+      "rule": "DEPT_ENUM",
+      "expect": "REJECT",
+      "why": "No department/directorate and the feed does not declare a silo.",
+      "payload": {
+        "REQUISITION_NO": "BAD-014",
+        "KM_FROM": "21.00",
+        "KM_TO": "21.20",
+        "TRACK": "DN_FAST",
+        "DURATION_MINS": "60"
+      }
+    },
+    {
+      "case_id": "ACI_OUT_OF_RANGE",
+      "rule": "ACI_RANGE",
+      "expect": "REJECT",
+      "why": "ACI is defined 0-100; 150 means the score was computed by a broken formula.",
+      "payload": {
+        "REQUISITION_NO": "BAD-015",
+        "DIRECTORATE": "ENGINEERING",
+        "KM_FROM": "21.00",
+        "KM_TO": "21.20",
+        "TRACK": "DN_FAST",
+        "DURATION_MINS": "60",
+        "ACI_SCORE": 150
+      }
+    },
+    {
+      "case_id": "HOTSPOT_IMPLAUSIBLE",
+      "rule": "HOTSPOT_RANGE",
+      "expect": "REJECT",
+      "why": "Thermovision sensor error: 612 C on a contact wire is physically impossible.",
+      "payload": {
+        "ASSET_ID": "BAD-016",
+        "WING": "TRD",
+        "CHAINAGE_FROM": "21.00",
+        "CHAINAGE_TO": "21.30",
+        "TRACK": "UP_FAST",
+        "DURATION": "60",
+        "HOTSPOT_TEMP_C": 612.0
+      }
+    },
+    {
+      "case_id": "NOT_OBJECT_RECORD",
+      "rule": "RECORD_TYPE",
+      "expect": "REJECT",
+      "why": "A bare string arrived where a requisition object was expected.",
+      "payload": "TMS-ENG-9999|19.4|21.2|DN_FAST"
+    },
+    {
+      "case_id": "NULL_REQUISITION",
+      "rule": "RECORD_TYPE",
+      "expect": "REJECT",
+      "why": "Null row from a LEFT JOIN in the CRIS extract.",
+      "payload": null
+    },
+    {
+      "case_id": "SPEED_RESTRICTION_ABOVE_LINE_SPEED",
+      "rule": "IRPWM_268B_SPEED_RESTRICTION",
+      "expect": "ACCEPT_BUT_FLAGGED",
+      "why": "Structurally valid, but a 145 km/h PSR exceeds the 110 km/h permissible section speed - the safety engine must flag it rather than the solver.",
+      "payload": {
+        "REQUISITION_NO": "WARN-001",
+        "DIRECTORATE": "ENGINEERING",
+        "KM_FROM": "19.00",
+        "KM_TO": "19.60",
+        "TRACK": "DN_FAST",
+        "DURATION_MINS": "120",
+        "SEVERITY": "URGENT",
+        "PSR_SPEED": 145,
+        "OHE_REQUIRED": "Y",
+        "TRAFFIC_BLOCK": "Y"
+      }
+    },
+    {
+      "case_id": "POWER_BLOCK_WITHOUT_TRAFFIC_BLOCK",
+      "rule": "ACTM_203_POWER_ISOLATION",
+      "expect": "ACCEPT_BUT_FLAGGED",
+      "why": "The DUTY sheet asks for a 25 kV isolation but no traffic block; LOTO cannot be assured, so the guardrail must block it before the simplex solver sees it.",
+      "payload": {
+        "ASSET_ID": "WARN-002",
+        "WING": "TRD",
+        "CHAINAGE_FROM": "33.00",
+        "CHAINAGE_TO": "33.40",
+        "TRACK": "DN_SLOW",
+        "DURATION": "60",
+        "PRIORITY": "CRITICAL",
+        "POWER_BLOCK": "Y",
+        "TRAFFIC_BLOCK": "N"
+      }
+    },
+    {
+      "case_id": "SNT_DISCONNECTION_WITHOUT_FORM",
+      "rule": "IRSEM_22_T351_DISCONNECTION",
+      "expect": "ACCEPT_BUT_FLAGGED",
+      "why": "Point machine work with no Form T/351 reference; IRSEM Para 22 paperwork is mandatory.",
+      "payload": {
+        "REQ_NO": "WARN-003",
+        "DEPT": "S&T",
+        "CHAINAGE_FROM": "27.10",
+        "CHAINAGE_TO": "27.30",
+        "RUNNING_LINE": "UP_FAST",
+        "WORK_TYPE": "POINT_MACHINE_TEST",
+        "SEVERITY": "CRITICAL",
+        "MINUTES": "60",
+        "DISCONNECTION": "Y",
+        "STATUTORY_FORM": "NONE"
+      }
+    },
+    {
+      "case_id": "METRES_EXPORTED_AS_CHAINAGE",
+      "rule": "CHAINAGE_UNIT_COERCION",
+      "expect": "ACCEPT",
+      "why": "Some CRIS columns export metres; 20400 M must coerce to km 20.40 rather than being rejected.",
+      "payload": {
+        "REQUISITION_NO": "OK-001",
+        "DIRECTORATE": "ENGINEERING",
+        "KM_FROM": "20400 M",
+        "KM_TO": "21200 M",
+        "TRACK": "DN_FAST",
+        "DURATION_MINS": "120",
+        "SEVERITY": "URGENT",
+        "OHE_REQUIRED": "Y",
+        "TRAFFIC_BLOCK": "Y"
+      }
+    },
+    {
+      "case_id": "LEGACY_ALIAS_SPELLINGS",
+      "rule": "ALIAS_NORMALISATION",
+      "expect": "ACCEPT",
+      "why": "Legacy silo spellings (P.WAY / 'DN FAST' / '2 hrs 30 min') must normalise to the canonical contract.",
+      "payload": {
+        "REQ_NO": "OK-002",
+        "DEPT": "P.WAY",
+        "KM_FROM": "40.10",
+        "KM_TO": "41.10",
+        "TRACK": "DN FAST",
+        "DURATION": "2 hrs 30 min",
+        "SEVERITY": "MEDIUM",
+        "OHE_REQUIRED": "Y",
+        "TRAFFIC_BLOCK": "Y",
+        "STATUTORY_FORM": "IRPWM_284"
+      }
+    },
+    {
+      "case_id": "BOOLEAN_SPELLINGS",
+      "rule": "BOOLEAN_COERCION",
+      "expect": "ACCEPT",
+      "why": "Booleans arrive as Y / YES / 1 / TRUE depending on the silo; all must coerce.",
+      "payload": {
+        "REQ_NO": "OK-003",
+        "DEPT": "S&T",
+        "CHAINAGE_FROM": "45.00",
+        "CHAINAGE_TO": "45.20",
+        "RUNNING_LINE": "DN_SLOW",
+        "MINUTES": "90",
+        "SEVERITY": "URGENT",
+        "DISCONNECTION": 1,
+        "STATUTORY_FORM": "T/351",
+        "POWER_BLOCK": "YES"
+      }
+    }
+  ]
+}
