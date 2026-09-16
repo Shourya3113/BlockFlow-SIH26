@@ -145,8 +145,13 @@ if __name__ == "__main__":
     print("Sample record:", data[0])
 
     requisition = normalize_tdms_defect(data[0])
+    print(f"LRS span        : {requisition.to_lrs_dict()}")
+    requisition.project_display()
     print(
-        f"Normalised      : {requisition.asset_id} [{requisition.dept.value}] "
-        f"km {requisition.km_start}-{requisition.km_end} on {requisition.line.value}"
+        f"Feeding post    : "
+        f"{requisition.feeding_post or requisition.display_start.station_code}"
     )
-    print(f"Feeding post    : {requisition.feeding_post or requisition.geo_start.station_code}")
+    print(
+        f"Display only    : {requisition.display_start.coordinates} "
+        "[read-only projection, never a solver input]"
+    )

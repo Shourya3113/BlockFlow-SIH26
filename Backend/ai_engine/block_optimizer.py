@@ -2,14 +2,115 @@
 block_optimizer.py - Multi-Department Integrated Block Optimizer & Shadow Bundler
 Solves the joint maintenance block scheduling problem using Mixed-Integer Programming (SciPy HiGHS)
 and Indian Railways Joint/Shadow Blocking heuristics.
+
+Spatial reasoning is 1D (LRS)
+------------------------------
+Every demand and every candidate block is a linear-referencing span -
+``(corridor_id, line_id, km_start, km_end)`` - and the *only* spatial question
+the solver asks is whether two of those kilometre intervals collide on the same
+running line:
+
+*   **Clustering (step 2).** Two demands are bundled when their chainage
+    intervals overlap or lie within :data:`BUNDLE_PROXIMITY_KM` of each other on
+the same line, because only then can they share a single isolation and a single
+possession.
+*   **Exclusivity (constraint 2).** Two candidate blocks whose intervals collide
+    cannot occupy the same slot.
+
+Both come straight from :mod:`Backend.data_ingestion.lrs`. There is no polygon,
+no Shapely geometry, no buffer radius and no section-code proxy anywhere in the
+MILP: a section is a reporting bookmark, and two jobs 8 km apart in the same
+section are not a conflict.
 """
 
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 import numpy as np
 from scipy.optimize import milp, LinearConstraint, Bounds
 from datetime import datetime, timedelta
 from .prioritizer import AssetCriticalityPrioritizer
+from ..data_ingestion import lrs
 from ..data_ingestion.coa_data import get_corridor_slots, evaluate_slot_disruption
+
+#: Two demands on the same running line whose chainage intervals are this close
+#: (or overlap) can share one isolation and therefore one joint possession.
+BUNDLE_PROXIMITY_KM = 0.5
+
+
+def _lrs_record(task: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    The 1D identity of a demand, tolerant of the legacy optimizer payload.
+
+    Accepts the explicit LRS spelling (``line_id``/``km_start``/``km_end``) and
+    the older silo spelling (``track_id``). Returns ``None`` when the record
+    carries no usable chainage, so a caller can decide what to do rather than
+    silently treating every unknown as co-located.
+    """
+    try:
+        return {
+            "corridor_id": lrs.corridor_id_of(task),
+            "line_id": lrs.line_id_of(task),
+            "km_start": lrs.km_start_of(task),
+            "km_end": lrs.km_end_of(task),
+        }
+    except (ValueError, TypeError):
+        return None
+
+
+def _lrs_clusters(
+    tasks: List[Dict[str, Any]],
+    proximity_km: float = BUNDLE_PROXIMITY_KM,
+) -> List[List[Dict[str, Any]]]:
+    """
+    Group demands into connected components of the 1D proximity relation.
+
+    Two demands are related when they share a corridor and a running line and
+    their kilometre intervals overlap or are within ``proximity_km``. Union-find
+    is used rather than a per-task bucket key, so the grouping is *transitive* -
+    which is what a joint possession actually is - and never depends on where an
+    arbitrary bucket boundary happened to fall.
+
+    A demand with no chainage at all falls back to its own singleton cluster, so
+    an incomplete silo row degrades to "cannot be bundled" instead of being
+    silently attached to an unrelated chainage.
+    """
+    identities = [_lrs_record(task) for task in tasks]
+    parent = list(range(len(tasks)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for i in range(len(tasks)):
+        for j in range(i + 1, len(tasks)):
+            a, b = identities[i], identities[j]
+            if a is None or b is None:
+                continue
+            if lrs.gap_km(a, b) <= proximity_km:
+                root_i, root_j = find(i), find(j)
+                if root_i != root_j:
+                    parent[max(root_i, root_j)] = min(root_i, root_j)
+
+    clusters: Dict[int, List[Dict[str, Any]]] = {}
+    for index, task in enumerate(tasks):
+        clusters.setdefault(find(index), []).append(task)
+    return list(clusters.values())
+
+
+def _lrs_envelope(cluster_tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Chainage envelope of a cluster: the extent the possession occupies."""
+    spans = [span for span in (_lrs_record(task) for task in cluster_tasks) if span]
+    if not spans:
+        return {"corridor_id": lrs.CORRIDOR_ID, "line_id": lrs.UNKNOWN_LINE_ID,
+                "km_start": 0.0, "km_end": 0.0}
+    return {
+        "corridor_id": spans[0]["corridor_id"],
+        "line_id": spans[0]["line_id"],
+        "km_start": min(span["km_start"] for span in spans),
+        "km_end": max(span["km_end"] for span in spans),
+    }
+
 
 class IntegratedBlockOptimizer:
     """
@@ -28,9 +129,14 @@ class IntegratedBlockOptimizer:
         """
         Executes multi-department joint optimization.
         1. Ranks all defects using Asset Criticality Index (ACI).
-        2. Clusters demands by Spatial Corridor (Section + Track).
+        2. Clusters demands by 1D chainage proximity on a running line (LRS).
         3. Applies Joint Shadow Blocking (Bundling S&T + TRD + Engg).
         4. Solves slot-allocation MILP to assign bundled blocks to lowest-impact COA corridor windows.
+
+        The spatial content of the model is exactly one relation -
+        :func:`Backend.data_ingestion.lrs.has_overlap` on
+        ``(corridor_id, line_id, km_start, km_end)`` - used to cluster demands
+        and to forbid two colliding blocks from sharing a slot.
         """
         if not defects:
             return {"scheduled_blocks": [], "unassigned_tasks": [], "metrics": {}}
@@ -38,20 +144,29 @@ class IntegratedBlockOptimizer:
         # Step 1: Prioritize all incoming tasks
         ranked_tasks = self.prioritizer.rank_maintenance_demands(defects)
 
-        # Step 2: Spatial Clustering for Joint Bundling
-        # Group tasks by (section, track_id)
-        spatial_clusters: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-        for task in ranked_tasks:
-            key = (task["section"], task["track_id"])
-            if key not in spatial_clusters:
-                spatial_clusters[key] = []
-            spatial_clusters[key].append(task)
+        # Step 2: 1D Linear Referencing clustering for Joint Bundling
+        # Demands are grouped by chainage proximity on a running line - not by
+        # section code - because that is the extent a single isolation and a
+        # single possession can actually cover.
+        spatial_clusters: List[List[Dict[str, Any]]] = _lrs_clusters(ranked_tasks)
 
         # Step 3: Create Candidate Joint Blocks
         candidate_blocks = []
         block_counter = 1
 
-        for (section, track_id), cluster_tasks in spatial_clusters.items():
+        for cluster_tasks in spatial_clusters:
+            # 1D extent of the whole cluster: what the possession must cover.
+            envelope = _lrs_envelope(cluster_tasks)
+            corridor_id = envelope["corridor_id"]
+            track_id = envelope["line_id"]
+            km_start = envelope["km_start"]
+            km_end = envelope["km_end"]
+            # Sectional bookmark for Control Office reporting only; it plays no
+            # part in the exclusivity mathematics below.
+            location_task = max(cluster_tasks, key=lambda t: t["duration_mins"])
+            section = location_task.get("section")
+            section_name = location_task.get("section_name", section)
+
             # Group into bundles where departments coordinate
             depts_in_cluster = {t["department"] for t in cluster_tasks}
             
@@ -92,6 +207,13 @@ class IntegratedBlockOptimizer:
 
                 candidate_blocks.append({
                     "candidate_id": f"CAND-BLK-{block_counter:03d}",
+                    # ---- 1D LRS identity of the possession ---------------- #
+                    "corridor_id": corridor_id,
+                    "line_id": track_id,
+                    "km_start": km_start,
+                    "km_end": km_end,
+                    "span_km": round(km_end - km_start, 3),
+                    # ---- sectional bookmark (reporting only) -------------- #
                     "section": section,
                     "section_name": primary_task.get("section_name", section),
                     "track_id": track_id,
@@ -192,19 +314,23 @@ class IntegratedBlockOptimizer:
             b_l.append(0.0)
             b_u.append(1.0)
 
-        # Constraint 2: Each slot can host at most 1 block per section (no overlapping blocks in same slot/section)
+        # Constraint 2: 1D chainage exclusivity.
+        # Two candidate blocks whose kilometre intervals collide on the same
+        # running line cannot share a slot. This pairwise interval test on
+        # (corridor_id, line_id, km_start, km_end) *is* the spatial constraint
+        # set - no polygon, no buffer, no float tolerance. Blocks on different
+        # running lines never collide (that is the point of a quad corridor),
+        # and neither do blocks whose chainage merely shares a section code -
+        # which the previous section-keyed form wrongly forbade.
+        colliding_pairs = lrs.conflicting_indices(candidate_blocks)
         for s_idx in range(N_slots):
-            for section in {b["section"] for b in candidate_blocks}:
+            for b_i, b_j in colliding_pairs:
                 row = np.zeros(num_vars)
-                has_member = False
-                for b_idx, block in enumerate(candidate_blocks):
-                    if block["section"] == section:
-                        row[b_idx * N_slots + s_idx] = 1.0
-                        has_member = True
-                if has_member:
-                    A_rows.append(row)
-                    b_l.append(0.0)
-                    b_u.append(1.0) # max 1 block per section per slot
+                row[b_i * N_slots + s_idx] = 1.0
+                row[b_j * N_slots + s_idx] = 1.0
+                A_rows.append(row)
+                b_l.append(0.0)
+                b_u.append(1.0) # at most one of the colliding pair per slot
 
         # Constraint 3: Duration constraint: block duration <= slot duration
         for b_idx, block in enumerate(candidate_blocks):
@@ -246,6 +372,13 @@ class IntegratedBlockOptimizer:
                             "slot_name": slot["slot_id"].split("-")[0] + " (" + slot["slot_type"] + ")",
                             "start_time": slot["start_time"],
                             "end_time": slot["end_time"],
+                            # ---- 1D LRS identity of the possession ------- #
+                            "corridor_id": block["corridor_id"],
+                            "line_id": block["line_id"],
+                            "km_start": block["km_start"],
+                            "km_end": block["km_end"],
+                            "span_km": block["span_km"],
+                            # ---- sectional bookmark (reporting only) ----- #
                             "section": block["section"],
                             "section_name": block["section_name"],
                             "track_id": block["track_id"],

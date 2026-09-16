@@ -21,6 +21,15 @@ Rules enforced here
     caution order.
 *   **Corridor boundary** - chainage must lie inside the surveyed 59.98 km
     Churchgate-Virar corridor.
+*   **LRS identity** - the running line must resolve to one of the four quad
+    lines, and the span must be a valid kilometre interval.
+
+Every spatial judgement here is 1D. A possession is a half-open chainage
+interval on a named running line, and two possessions conflict exactly when
+those intervals collide on the same line - see
+:func:`Backend.data_ingestion.lrs.has_overlap`. There is no polygon, no buffer
+radius and no geometric intersection anywhere in this module, so there is no
+float tolerance for a schedule to hide behind.
 
 Everything in this module is deterministic and dependency-free: the same
 requisition always yields the same verdict, which is what makes the
@@ -30,7 +39,7 @@ requisition always yields the same verdict, which is what makes the
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Union
 
-from . import waypoints
+from . import lrs, waypoints
 
 #: ACTM Vol II Para 204 - earthing / discharge buffer, minutes, each side.
 ACTM_PARA_204_EARTHING_BUFFER_MINS = 15
@@ -163,6 +172,22 @@ def compute_earthing_window(
 
 
 # --------------------------------------------------------------------------- #
+#  Linear lookup helpers
+# --------------------------------------------------------------------------- #
+def _section_for_km_safe(km: Any) -> Optional[str]:
+    """
+    Sectional bookmark for a chainage, or ``None`` when it cannot be resolved.
+
+    A pure 1D lookup on the kilometre post - section codes are a reporting
+    convenience and play no part in deciding a collision.
+    """
+    try:
+        return waypoints.section_for_km(km)
+    except (TypeError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------------- #
 #  Statutory paperwork
 # --------------------------------------------------------------------------- #
 def generate_statutory_memos(
@@ -182,7 +207,7 @@ def generate_statutory_memos(
     line = requisition.get("line") or requisition.get("track_id") or "UNKNOWN"
     km_start = requisition.get("km_start")
     km_end = requisition.get("km_end")
-    section = requisition.get("section") or waypoints.section_for_km(float(km_start))
+    section = requisition.get("section") or _section_for_km_safe(km_start)
     power_required = bool(
         requisition.get("requires_power_block") or dept in ("TRD", "ELECTRICAL_TRD", "ELECTRICAL")
     )
@@ -316,13 +341,31 @@ def evaluate_safety_invariants(requisition: Dict[str, Any]) -> Dict[str, Any]:
     dept_raw = req.get("dept") or req.get("department") or ""
     dept = str(dept_raw.value if hasattr(dept_raw, "value") else dept_raw).upper()
     asset_id = req.get("asset_id") or req.get("defect_id") or "UNKNOWN"
-    line = req.get("line") or req.get("track_id") or "UNKNOWN"
+    # The running line comes from the LRS field first, then the legacy optimiser
+    # spellings, and is bucketed as UNKNOWN (which collides conservatively)
+    # rather than being silently dropped.
+    line_id = lrs.line_id_of(req)
+    corridor_id = lrs.corridor_id_of(req)
+    line = line_id
     km_start = req.get("km_start")
     km_end = req.get("km_end")
     duration = int(req.get("duration_mins") or 0)
 
     checks: List[Dict[str, Any]] = []
     violations: List[str] = []
+
+    # 0. LRS identity ------------------------------------------------------- #
+    line_ok = line_id in lrs.LINE_IDS
+    checks.append(_check(
+        "LRS_LINE_ID",
+        "Running line is one of the four quad lines on the LRS corridor",
+        line_ok,
+        f"line_id={line_id} on corridor_id={corridor_id}" if line_ok
+        else f"unresolvable running line {req.get('line_id') or req.get('line') or req.get('track_id')!r}; "
+        f"expected one of {list(lrs.LINE_IDS)}",
+    ))
+    if not line_ok:
+        violations.append("LRS_LINE_ID")
 
     # 1. Corridor boundary -------------------------------------------------- #
     inside = waypoints.validate_chainage(km_start) and waypoints.validate_chainage(km_end)
@@ -504,10 +547,13 @@ def evaluate_safety_invariants(requisition: Dict[str, Any]) -> Dict[str, Any]:
     verdict: Dict[str, Any] = {
         "asset_id": asset_id,
         "dept": dept,
+        # ---- LRS identity of the evaluated span ---------------------------- #
+        "corridor_id": corridor_id,
+        "line_id": line_id,
         "line": line,
         "km_start": km_start,
         "km_end": km_end,
-        "section": req.get("section") or waypoints.section_for_km(km_start),
+        "section": req.get("section") or _section_for_km_safe(km_start),
         "passed": passed,
         "status": "SAFE_TO_SCHEDULE" if passed else "BLOCKED_BY_SAFETY_INVARIANT",
         "violations": violations,
@@ -586,6 +632,45 @@ def possession_of(task: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+def _lrs_span(block: Dict[str, Any], tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    1D chainage extent of a scheduled block.
+
+    Prefers the block's own ``corridor_id``/``line_id``/``km_start``/``km_end``
+    (written by the LRS-aware optimizer) and otherwise takes the union of its
+    bundled tasks - so a block dict that only ever carried ``section`` and
+    ``track_id`` can still be assessed in the chainage domain. Returns an empty
+    dict when no chainage is present at all, which the caller reports as an
+    unresolved-extent violation rather than silently waving the pair through.
+    """
+    line_raw = block.get("line_id") or block.get("track_id") or block.get("line")
+    corridor_raw = block.get("corridor_id") or block.get("corridor")
+    starts = [] if block.get("km_start") is None else [block["km_start"]]
+    ends = [] if block.get("km_end") is None else [block["km_end"]]
+
+    for task in tasks:
+        if task.get("km_start") is not None:
+            starts.append(task["km_start"])
+        if task.get("km_end") is not None:
+            ends.append(task["km_end"])
+        if line_raw is None:
+            line_raw = task.get("line_id") or task.get("track_id") or task.get("line")
+        if corridor_raw is None:
+            corridor_raw = task.get("corridor_id")
+
+    if not starts or not ends:
+        return {}
+    try:
+        return {
+            "corridor_id": lrs.coerce_corridor_id(corridor_raw),
+            "line_id": lrs.coerce_line_id(line_raw),
+            "km_start": min(lrs.coerce_km(value) for value in starts),
+            "km_end": max(lrs.coerce_km(value) for value in ends),
+        }
+    except (ValueError, TypeError):
+        return {}
+
+
 def validate_plan(blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Post-solve guardrail over the optimizer's own output.
@@ -597,8 +682,12 @@ def validate_plan(blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
        earthing wrap** fits its corridor window. This is where a scheduler that
        budgets only the working duration is caught: the section is physically
        occupied for ``duration + 15 + 15`` minutes, not ``duration``.
-    2. Physical conflict exclusivity - no two possessions overlap in time on the
-       same section and running line.
+    2. **1D chainage exclusivity** - no two possessions whose kilometre
+       intervals collide on the same running line overlap in time. The test is
+       :func:`lrs.has_overlap` on ``(corridor_id, line_id, km_start, km_end)``.
+       Note what it deliberately does *not* say: two jobs in the same
+       ``section`` but different chainage are **not** a conflict, which is why
+       this guardrail is keyed on kilometre posts rather than on section codes.
     3. ACTM Para 204 arithmetic - the scheduled possession is at least
        ``max(work + 2 x buffer)`` over the bundled tasks, i.e. the earthing
        buffer of every job it wraps is actually paid for.
@@ -629,6 +718,8 @@ def validate_plan(blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
             "allocated_mins": allocated,
             "required_mins": max(m["required_mins"] for m in per_task),
             "buffer_mins": max(m["buffer_mins"] for m in per_task),
+            # The 1D extent the exclusivity invariant is evaluated on.
+            "span": _lrs_span(block, tasks),
         }
 
     for index, block in enumerate(blocks):
@@ -658,22 +749,59 @@ def validate_plan(blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not envelope_ok:
             violations.append(f"POWER_ISOLATION_ENVELOPE:{label}")
 
+    metrics_by_index = [_block_metrics(block) for block in blocks]
+
     for i in range(len(blocks)):
         for j in range(i + 1, len(blocks)):
             a, b = blocks[i], blocks[j]
-            if a.get("section") != b.get("section") or a.get("track_id") != b.get("track_id"):
-                continue
-            a_metrics, b_metrics = _block_metrics(a), _block_metrics(b)
-            overlap = a_metrics["start"] < b_metrics["end"] and b_metrics["start"] < a_metrics["end"]
+            a_metrics, b_metrics = metrics_by_index[i], metrics_by_index[j]
             label = f"{a.get('block_id')}~{b.get('block_id')}"
+
+            # Different corridor or different running line -> no 1D interaction
+            # is possible, so there is nothing for this pair to answer for.
+            if not a_metrics["span"] or not b_metrics["span"]:
+                checks.append(_check(
+                    "LRS_EXTENT_RESOLVED",
+                    "Every scheduled block resolves to a 1D chainage interval",
+                    False,
+                    f"{label}: block carries no corridor_id/line_id/km_start/km_end "
+                    "and none of its bundled tasks do either",
+                    severity=DEPARTMENT_SCALE_WARNING,
+                ))
+                violations.append(f"LRS_EXTENT_RESOLVED:{label}")
+                continue
+            if not lrs.same_line(a_metrics["span"], b_metrics["span"]):
+                continue
+
+            # 1D chainage collision: the whole of the spatial test.
+            shared_km = lrs.overlap_length_km(a_metrics["span"], b_metrics["span"])
+            time_overlap = (
+                a_metrics["start"] < b_metrics["end"]
+                and b_metrics["start"] < a_metrics["end"]
+            )
+            conflict = shared_km > 0.0 and time_overlap
+
+            a_span, b_span = a_metrics["span"], b_metrics["span"]
+            detail = (
+                f"{label}: {a_span['line_id']} km {a_span['km_start']}-{a_span['km_end']} vs "
+                f"km {b_span['km_start']}-{b_span['km_end']} -> "
+            )
+            if shared_km > 0.0 and time_overlap:
+                detail += f"CONFLICT over {shared_km:.3f} km in an overlapping time window"
+            elif shared_km > 0.0:
+                detail += f"{shared_km:.3f} km of shared chainage, disjoint in time"
+            else:
+                detail += f"disjoint chainage ({lrs.gap_km(a_span, b_span):.3f} km apart)"
+
             checks.append(_check(
-                "PHYSICAL_EXCLUSIVITY",
-                "No two possessions overlap on the same section and running line",
-                not overlap,
-                f"{label}: {'OVERLAP' if overlap else 'disjoint'}",
+                "CHAINAGE_INTERVAL_EXCLUSIVITY",
+                "No two possessions whose 1D chainage intervals collide on the same "
+                "running line occupy overlapping time windows",
+                not conflict,
+                detail,
             ))
-            if overlap:
-                violations.append(f"PHYSICAL_EXCLUSIVITY:{label}")
+            if conflict:
+                violations.append(f"CHAINAGE_INTERVAL_EXCLUSIVITY:{label}")
 
     return {
         "passed": not violations,

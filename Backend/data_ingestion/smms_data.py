@@ -137,7 +137,6 @@ if __name__ == "__main__":
     print("Sample record:", data[0])
 
     requisition = normalize_smms_defect(data[0])
-    print(
-        f"Normalised      : {requisition.asset_id} [{requisition.dept.value}] "
-        f"km {requisition.km_start}-{requisition.km_end} on {requisition.line.value}"
-    )
+    print(f"LRS span        : {requisition.to_lrs_dict()}")
+    if requisition.requires_disconnection:
+        print("IRSEM T/351  : gear disconnection expected (invariant checked downstream)")

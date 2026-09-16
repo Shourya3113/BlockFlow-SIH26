@@ -147,11 +147,10 @@ if __name__ == "__main__":
     print("Sample record:", data[0])
 
     requisition = normalize_tms_defect(data[0])
+    print(f"LRS span        : {requisition.to_lrs_dict()}")
+    requisition.project_display()
     print(
-        f"Normalised      : {requisition.asset_id} [{requisition.dept.value}] "
-        f"km {requisition.km_start}-{requisition.km_end} on {requisition.line.value}"
-    )
-    print(
-        f"Snapped to      : {requisition.geo_start.lon}, {requisition.geo_start.lat} "
-        f"({requisition.geo_start.nearest_waypoint_id}, section {requisition.section})"
+        f"Display only    : {requisition.display_start.coordinates} "
+        f"({requisition.display_start.nearest_waypoint_id}, section {requisition.section})"
+        "  [read-only projection, never a solver input]"
     )

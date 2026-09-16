@@ -1,8 +1,8 @@
 """
-pipeline.py - Unified Spatial Ingestion Pipeline (CRIS silos -> one contract)
+pipeline.py - Unified LRS Ingestion Pipeline (CRIS silos -> one contract)
 
 The single entry point that turns heterogeneous departmental payloads into
-validated, spatially-snapped, safety-cleared requisitions that the HiGHS
+validated, linear-referenced, safety-cleared requisitions that the HiGHS
 optimizer can consume without a single runtime surprise.
 
     CRIS TMS / SMMS / TDMS / COA payloads
@@ -11,16 +11,25 @@ optimizer can consume without a single runtime surprise.
     normalise_raw_requisition()   heterogenous keys, encodings, bool spellings
               |
               v
-    BlockRequisition (Pydantic v2)  frozen 5-field contract + invariants
-              |
+    BlockRequisition (Pydantic v2)  frozen 5-field contract + LRS span + invariants
+              |                 (corridor_id, line_id, km_start, km_end)
               v
-    with_spatial_fix()            439-point WGS84 waypoint database snap
-              |
+    project_display()              439-point waypoint table -> read-only [lat, lon]
+              |                 (display enrichment ONLY - never a solver input)
               v
     safety.evaluate_safety_invariants()   ACTM 203/204, IRSEM T/351, PSR
               |
               v
     IngestReport  -> accepted | rejected (with reasons) | GeoJSON | verdicts
+
+Linear in, geographic out
+-------------------------
+The normaliser's *job* is to produce a 1D span, because that is the shape the
+solver reasons about: two requisitions conflict iff their chainage intervals
+collide on the same running line
+(:func:`Backend.data_ingestion.lrs.has_overlap`). Latitude and longitude are
+attached afterwards, as an inert projection for the frontend, and no constraint
+or invariant reads them back.
 
 Why silo payloads collapse so cleanly
 -------------------------------------
@@ -40,7 +49,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from pydantic import ValidationError
 
-from . import safety, waypoints
+from . import lrs, safety, waypoints
+from .lrs import CORRIDOR_ID
 from .schema import (
     DEPT_ALIASES,
     BlockRequisition,
@@ -67,8 +77,11 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
         "km_end", "km_to", "to_km", "chainage_to", "km_end_chainage",
         "km_to_chainage", "end_km", "chainage",
     ),
-    "line": (
-        "line", "track", "track_id", "running_line", "line_no", "road",
+    "corridor_id": (
+        "corridor_id", "corridor", "corridor_code", "zone", "route", "route_id",
+    ),
+    "line_id": (
+        "line_id", "line", "track", "track_id", "running_line", "line_no", "road",
         "track_no", "up_dn",
     ),
     "duration_mins": (
@@ -295,6 +308,13 @@ def normalize_raw_requisition(
         disconnection = True  # S&T gear work is a Form T/351 disconnection by default
     payload["requires_disconnection"] = _coerce_bool(disconnection, default=False)
 
+    # ---- LRS identity ---------------------------------------------------- #
+    # A single-corridor deployment lets the corridor default in; the running
+    # line never does, because a job on the wrong line is a different job.
+    payload.setdefault("corridor_id", CORRIDOR_ID)
+    if payload.get("corridor_id") in (None, ""):
+        payload["corridor_id"] = CORRIDOR_ID
+
     # ---- provenance + bookkeeping ---------------------------------------- #
     payload["reported_date"] = _source_date(raw)
     payload["defect_id"] = str(payload.get("asset_id")) if payload.get("asset_id") else None
@@ -311,7 +331,16 @@ def normalize_raw_requisition(
 #  GeoJSON emission
 # --------------------------------------------------------------------------- #
 def requisition_geojson_feature(requisition: BlockRequisition) -> Dict[str, Any]:
-    """One requisition as a GeoJSON Feature (possession corridor LineString)."""
+    """
+    One requisition as a GeoJSON Feature, for **rendering only**.
+
+    This is the downstream half of the linear-in/geographic-out rule: the LRS
+    identity (``corridor_id``/``line_id``/``km_start``/``km_end``) is written
+    into the feature properties as the authoritative identity, and the
+    LineString coordinates are the projected *display* of it. Nothing consumes
+    this feature to decide a schedule or to test a collision - the optimizer
+    and the guardrail both work off the LRS fields directly.
+    """
     from .spatial import (
         TRACK_LATERAL_OFFSET_M,
         geojson_linestring,
@@ -319,8 +348,8 @@ def requisition_geojson_feature(requisition: BlockRequisition) -> Dict[str, Any]
         shift_polyline,
     )
 
-    if requisition.geo_start is None or requisition.geo_end is None:
-        requisition.with_spatial_fix()
+    if requisition.display_start is None or requisition.display_end is None:
+        requisition.project_display()
 
     coords = polyline_between(
         waypoints.CENTERLINE,
@@ -329,21 +358,22 @@ def requisition_geojson_feature(requisition: BlockRequisition) -> Dict[str, Any]
         requisition.km_end,
         step_km=0.25,
     )
-    offset_m = TRACK_LATERAL_OFFSET_M.get(requisition.line.value, 0.0)
+    offset_m = TRACK_LATERAL_OFFSET_M.get(requisition.line_id, 0.0)
     line_coords = shift_polyline(coords, offset_m)
 
-    start_fix = requisition.geo_start
+    start_fix = requisition.display_start
     window = safety.compute_earthing_window(
         None, requisition.duration_mins, requisition.power_isolation_required
     )
     properties = {
+        # ---- authoritative 1D identity ---------------------------------- #
+        **requisition.to_lrs_dict(),
+        "lrs_key": list(requisition.lrs_key),
+        # ---- contract / provenance ------------------------------------- #
         "asset_id": requisition.asset_id,
         "dept": requisition.dept.value,
         "system": requisition.system,
-        "line": requisition.line.value,
-        "km_start": requisition.km_start,
-        "km_end": requisition.km_end,
-        "span_km": requisition.span_km,
+        "line": requisition.line_id,
         "section": requisition.section,
         "section_name": requisition.section_name,
         "duration_mins": requisition.duration_mins,
@@ -356,18 +386,21 @@ def requisition_geojson_feature(requisition: BlockRequisition) -> Dict[str, Any]
         "requires_disconnection": requisition.requires_disconnection,
         "actm_para_204_buffer_mins": safety.ACTM_PARA_204_EARTHING_BUFFER_MINS,
         "total_possession_mins": window["total_possession_mins"],
+        # ---- projected display extras ---------------------------------- #
         "start_station": start_fix.station_code if start_fix else None,
         "start_waypoint_id": start_fix.nearest_waypoint_id if start_fix else None,
-        "end_station": requisition.geo_end.station_code if requisition.geo_end else None,
+        "end_station": requisition.display_end.station_code if requisition.display_end else None,
         "track_offset_m": offset_m,
         "lateral_offset_applied": True,
+        "projection_only": True,
     }
     feature = geojson_linestring(line_coords, properties)
     feature["id"] = requisition.asset_id
     feature["geometry"]["type"] = "LineString"
     # Anchor point at the start of the possession for map labels.
     feature["geometry_start"] = (
-        {"type": "Point", "coordinates": start_fix.coordinates} if start_fix else None
+        {"type": "Point", "coordinates": start_fix.geojson_coordinates}
+        if start_fix else None
     )
     return feature
 
@@ -376,28 +409,36 @@ def build_requisition_geojson(
     requisitions: Iterable[BlockRequisition],
     name: str = "WR_MAINTENANCE_REQUISITIONS",
 ) -> Dict[str, Any]:
-    """FeatureCollection of every accepted requisition (PM Gati Shakti export)."""
+    """
+    FeatureCollection of every accepted requisition (PM Gati Shakti export).
+
+    An **auxiliary display artefact**. It is produced from the LRS spans but is
+    never fed back into the optimizer, the safety invariants or any collision
+    test - those all read ``corridor_id``/``line_id``/``km_start``/``km_end``.
+    """
     from .spatial import geojson_feature_collection, geojson_point
 
     features: List[Dict[str, Any]] = []
     for requisition in requisitions:
         features.append(requisition_geojson_feature(requisition))
-        for label in ("geo_start", "geo_end"):
-            fix = getattr(requisition, label, None)
-            if fix is not None:
+        for label in ("display_start", "display_end"):
+            projection = getattr(requisition, label, None)
+            if projection is not None:
                 features.append(
                     geojson_point(
-                        fix.lon,
-                        fix.lat,
+                        projection.lon,
+                        projection.lat,
                         {
+                            "corridor_id": requisition.corridor_id,
+                            "line_id": requisition.line_id,
                             "asset_id": requisition.asset_id,
                             "dept": requisition.dept.value,
                             "marker": label,
-                            "km": fix.km,
-                            "line": requisition.line.value,
-                            "section": fix.section,
-                            "station_code": fix.station_code,
-                            "waypoint_id": fix.nearest_waypoint_id,
+                            "km": projection.km,
+                            "section": projection.section,
+                            "station_code": projection.station_code,
+                            "waypoint_id": projection.nearest_waypoint_id,
+                            "projection_only": True,
                         },
                     )
                 )
@@ -405,10 +446,12 @@ def build_requisition_geojson(
         features,
         name=name,
         extra_properties={
+            "corridor_id": CORRIDOR_ID,
             "corridor": waypoints.CORRIDOR["name"],
-            "length_km": waypoints.CORRIDOR_LENGTH_KM,
+            "length_km": lrs.CORRIDOR_LENGTH_KM,
             "requisition_count": len(features),
             "datum": "WGS84",
+            "projection_only": True,
             "generated_at": datetime.now().isoformat(timespec="seconds"),
         },
     )
@@ -472,25 +515,41 @@ def ingest_feed(
         records = [payload]
 
     declared_source = declared_source.upper() if declared_source else None
+
+    # ---- corridor identity ------------------------------------------------ #
+    # A feed may declare its corridor; a per-record field always wins over it.
+    declared_corridor = CORRIDOR_ID
+    raw_corridor = (
+        payload.get("corridor") if isinstance(payload, Mapping)
+        else getattr(payload, "corridor", None)
+    )
+    if raw_corridor:
+        declared_corridor = lrs.coerce_corridor_id(raw_corridor)
+
     accepted: List[BlockRequisition] = []
     rejected: List[RejectedRequisition] = []
     warnings: List[str] = []
 
     for index, raw in enumerate(records):
         raw_mapping = raw if isinstance(raw, Mapping) else {"value": raw}
+        if isinstance(raw_mapping, Mapping) and _pick(raw_mapping, FIELD_ALIASES["corridor_id"]) is None:
+            raw_mapping = {**raw_mapping, "corridor_id": declared_corridor}
         try:
             requisition = normalize_raw_requisition(raw_mapping, source=declared_source, index=index)
-            requisition.with_spatial_fix()
+            # Read-only display projection: attached after validation, never
+            # consulted by it.
+            requisition.project_display()
         except (ValidationError, ValueError, TypeError) as exc:
             rejected.append(
                 RejectedRequisition(
                     index=index,
                     source=declared_source,
                     asset_id=_pick(raw_mapping, FIELD_ALIASES["asset_id"]) if isinstance(raw_mapping, Mapping) else None,
-                    dept=_pick(raw_mapping, FIELD_ALIASES["dept"]) if isinstance(raw_mapping, Mapping) else None,
-                    km_start=_pick(raw_mapping, FIELD_ALIASES["km_start"]) if isinstance(raw_mapping, Mapping) else None,
-                    km_end=_pick(raw_mapping, FIELD_ALIASES["km_end"]) if isinstance(raw_mapping, Mapping) else None,
-                    errors=_validation_errors(exc, index),
+                    dept=_pick(raw_mapping, FIELD_ALIASES["dept"]) if isinstance(raw_mapping, Mapping) else None,                        km_start=_pick(raw_mapping, FIELD_ALIASES["km_start"]) if isinstance(raw_mapping, Mapping) else None,
+                        km_end=_pick(raw_mapping, FIELD_ALIASES["km_end"]) if isinstance(raw_mapping, Mapping) else None,
+                        line_id=_pick(raw_mapping, FIELD_ALIASES["line_id"]) if isinstance(raw_mapping, Mapping) else None,
+                        corridor_id=declared_corridor,
+                        errors=_validation_errors(exc, index),
                     raw=dict(raw_mapping) if isinstance(raw_mapping, Mapping) else {"value": repr(raw)},
                 )
             )
@@ -521,6 +580,7 @@ def ingest_feed(
     report = IngestReport(
         feed_id=feed_id,
         source=declared_source,
+        corridor_id=declared_corridor,
         corridor=str(waypoints.CORRIDOR["name"]),
         received=len(records),
         accepted_count=len(accepted),
@@ -552,6 +612,7 @@ def merge_reports(reports: Sequence[IngestReport]) -> IngestReport:
     merged = IngestReport(
         feed_id="+".join(filter(None, (r.feed_id for r in reports))) or None,
         source="+".join(filter(None, (r.source for r in reports))) or None,
+        corridor_id=CORRIDOR_ID,
         corridor=str(waypoints.CORRIDOR["name"]),
         received=received,
         accepted_count=len(accepted),
@@ -641,8 +702,15 @@ if __name__ == "__main__":  # pragma: no cover - manual inspection helper
     if corridor.accepted:
         first = corridor.accepted[0]
         print(
-            f"\nSample          : {first.asset_id} [{first.dept.value}] {first.line.value} "
-            f"km {first.km_start}-{first.km_end} -> {first.geo_start.lon}, {first.geo_start.lat} "
-            f"({first.geo_start.nearest_waypoint_id})"
+            f"\nSample          : {first.asset_id} [{first.dept.value}] "
+            f"{first.corridor_id} / {first.line_id} "
+            f"km {first.km_start}-{first.km_end} (span {first.span_km} km)"
         )
+        print(f"LRS span        : {first.to_lrs_dict()}")
+        print(
+            f"Display         : {first.display_start.coordinates} ({first.display_start.nearest_waypoint_id}) "
+            "[read-only projection, not a solver input]"
+        )
+        colliding = corridor.chainage_conflict_pairs()
+        print(f"1D collisions   : {len(colliding)} candidate pair(s) to bundle")
         print(f"Optimizer rows  : {len(to_optimizer_payload(corridor))}")
