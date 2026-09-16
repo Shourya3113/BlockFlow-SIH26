@@ -8,6 +8,16 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any
 from .tms_data import SECTIONS, TRACKS
 
+#: Coded fault classification SMMS attaches to each work type.
+FAULT_CODES = {
+    "POINT_MACHINE_TEST": "PM_OBSTRUCTION",
+    "AXLE_COUNTER_CALIBRATION": "MSDAC_DRIFT",
+    "TRACK_CIRCUIT_BONDING": "AFTC_BOND",
+    "ELECTRONIC_INTERLOCKING_DIAG": "EI_CPU_DIAG",
+    "SIGNAL_ASPECT_REPLACEMENT": "LED_ASPECT",
+    "LC_GATE_INTERLOCK_TEST": "LCG_INTERLOCK",
+}
+
 SNT_TASKS = [
     {
         "type": "POINT_MACHINE_TEST",
@@ -90,6 +100,16 @@ def generate_smms_defects(count: int = 20, seed: int = 43) -> List[Dict[str, Any
             "km_start": km_start,
             "km_end": km_end,
             "gear_id": f"PT-{sec['code'][:3]}-{10 + i}",
+            # Canonical engineering attributes (legacy spellings retained for the
+            # optimizer/ACI bridge).
+            "work_type": task_tmpl["type"],
+            "fault_code": FAULT_CODES[task_tmpl["type"]],
+            "requested_duration_mins": task_tmpl["base_duration_mins"],
+            "speed_restriction_psr": None,
+            # Whether the work opens a circuit is an attribute of the work, not a
+            # memo the silo has to hold. It drives downstream Form T/351/T/352
+            # generation; nothing here validates paperwork.
+            "requires_disconnection": task_tmpl["requires_disconnection"],
             "defect_type": task_tmpl["type"],
             "description": task_tmpl["description"],
             "severity": task_tmpl["severity"],

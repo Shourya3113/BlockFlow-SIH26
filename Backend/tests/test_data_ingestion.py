@@ -37,9 +37,15 @@ from Backend.data_ingestion import (  # noqa: E402
     ACTM_PARA_204_EARTHING_BUFFER_MINS,
     CONTRACT_FIELDS,
     LRS_FIELDS,
+    Authority,
     BlockRequisition,
+    DigitalGrantPermit,
+    FormCode,
     LinearSpan,
+    PermitStatus,
+    build_permits_for_block,
     coa_data,
+    derive_permit_requirements,
     gap_km,
     has_overlap,
     ingest_corridor,
@@ -48,6 +54,7 @@ from Backend.data_ingestion import (  # noqa: E402
     lrs,
     merge_spans,
     overlap_length_km,
+    permits,
     safety,
     schema,
     spatial,
@@ -412,37 +419,215 @@ def test_actm_para_204_earthing_buffer():
     assert verdict["earthing_window"]["total_possession_mins"] == 90
 
 
-def test_irsem_form_t351_disconnection():
+def test_statutory_memos_are_outputs_not_inputs():
+    """
+    Form T/351 / T/352 are *generated after scheduling*, never demanded on the way in.
+
+    A requisition arriving weeks ahead of the planning horizon cannot cite a memo
+    that a Sectional Controller has not issued yet, so the old ``statutory_form``
+    gate rejected conforming data. What is still enforced is the engineering
+    completeness Form T/351 needs: a disconnection job must name its gear.
+    """
+    # The contract no longer has an input field for it at all.
+    assert "statutory_form" not in BlockRequisition.model_fields
+    assert "referenced_form" in BlockRequisition.model_fields
+
+    base = {
+        "asset_id": "SMMS-SNT-2011", "dept": "SNT", "line_id": "DN_SLOW",
+        "km_start": 33.95, "km_end": 34.15, "requested_duration_mins": 60,
+        "work_type": "POINT_MACHINE_TEST", "gear_id": "PT-DDR-11",
+        "requires_disconnection": True, "requires_traffic_block": True,
+    }
+
+    # (a) citing no form at all is fine - the memo does not exist yet.
+    bare = safety.evaluate_safety_invariants(base)
+    assert bare["passed"], bare["violations"]
+    assert set(bare["statutory_forms_required"]) >= {"T_351", "T_352"}
+    assert bare["referenced_form"] is None
+
+    # (b) citing one is fine too; it is recorded as provenance and nothing more.
+    cited = safety.evaluate_safety_invariants({**base, "statutory_form": "T/351"})
+    assert cited["passed"], cited["violations"]
+    assert cited["referenced_form"] == "T_351"
+    assert cited["statutory_forms_required"] == bare["statutory_forms_required"], (
+        "a cited form must not change what is generated"
+    )
+
+    # (c) even a nonsense citation is not a rejection - it simply is not recorded.
+    junk = safety.evaluate_safety_invariants({**base, "statutory_form": "FORM 99/ZZ"})
+    assert junk["passed"], junk["violations"]
+    assert junk["referenced_form"] is None
+
+    # (d) the one thing still enforced: a disconnection must name its gear, or
+    #     Form T/351 cannot be prefilled downstream.
+    unnamed = safety.evaluate_safety_invariants({
+        **base, "gear_id": None, "point_no": None,
+    })
+    assert not unnamed["passed"]
+    assert "DISCONNECTION_GEAR_IDENTIFIED" in unnamed["violations"]
+
+    # (e) the requirement is derived, and the derivation is auditable.
+    requirements = derive_permit_requirements(base)
+    assert requirements.forms == ["T_351", "T_352"]
+    assert any("disconnection" in reason for reason in requirements.reasons)
+
+    # (f) an S&T job that touches no field gear raises no Form T/351 - the
+    #     pre-refactor code forced one onto every SMMS row off the department
+    #     alone, manufacturing paperwork for diagnostics.
+    diagnostic = derive_permit_requirements({
+        "dept": "SNT", "line_id": "DN_SLOW", "km_start": 10.0, "km_end": 10.2,
+        "work_type": "ELECTRONIC_INTERLOCKING_DIAG", "requires_disconnection": False,
+    })
+    assert diagnostic.forms == []
+
+
+def test_permit_bundle_is_prefilled_from_the_memo_side():
+    """The instruments a requisition attracts, and the window arithmetic they carry."""
     snT = {
-        "asset_id": "SMMS-SNT-2011", "dept": "SNT", "line": "DN_SLOW",
-        "km_start": 33.95, "km_end": 34.15, "duration_mins": 60,
-        "requires_disconnection": True, "statutory_form": "T/351",
-        "requires_traffic_block": True,
+        "asset_id": "SMMS-SNT-2011", "dept": "SNT", "line_id": "DN_SLOW",
+        "km_start": 33.95, "km_end": 34.15, "requested_duration_mins": 60,
+        "work_type": "POINT_MACHINE_TEST", "gear_id": "PT-DDR-11",
+        "requires_disconnection": True, "requires_traffic_block": True,
+        "work_start": "01:30",
     }
     verdict = safety.evaluate_safety_invariants(snT)
     assert verdict["passed"], verdict["violations"]
-    assert set(verdict["statutory_forms_required"]) >= {"T_351", "T_352"}
 
     forms = {memo["form_no"]: memo for memo in verdict["memos"]}
     assert "IRSEM Para 22" in forms["T_351"]["statutory_reference"]
     assert forms["T_351"]["km_range"] == "33.95 - 34.15"
     assert forms["T_352"]["valid_from"] == verdict["earthing_window"]["power_restored_at"]
 
-    # A disconnection job with no Form T/351 must be blocked, not waved through.
-    missing = {**snT, "statutory_form": "NONE"}
-    blocked = safety.evaluate_safety_invariants(missing)
-    assert not blocked["passed"]
-    assert "IRSEM_22_T351_DISCONNECTION" in blocked["violations"]
+    # The paired notices cross-reference each other.
+    assert forms["T_351"]["reconnection_form_no"] == forms["T_352"]["memo_no"]
+    assert forms["T_352"]["disconnection_form_no"] == forms["T_351"]["memo_no"]
+    # ...and the gear is named, because the requirement is derived from the work.
+    assert [gear["gear_id"] for gear in forms["T_351"]["affected_gears"]] == ["PT-DDR-11"]
 
-    # A civil tamping job is not an IRSEM disconnection job.
+    # A civil tamping job is not an IRSEM disconnection job, but it does pull in
+    # an ACTM Permit-to-Work for its 25 kV isolation and a Para 284 caution order.
     civil = safety.evaluate_safety_invariants({
-        "asset_id": "TMS-ENG-1006", "dept": "CIVIL", "line": "DN_FAST",
-        "km_start": 19.4, "km_end": 21.2, "duration_mins": 180,
-        "requires_power_block": True, "requires_traffic_block": True,
+        "asset_id": "TMS-ENG-1006", "dept": "CIVIL", "line_id": "DN_FAST",
+        "km_start": 19.4, "km_end": 21.2, "requested_duration_mins": 180,
+        "work_type": "TRACK_TAMPING", "requires_power_block": True,
+        "requires_traffic_block": True, "work_start": "01:30",
     })
-    assert civil["passed"]
+    assert civil["passed"], civil["violations"]
     assert "T_351" not in civil["statutory_forms_required"]
-    assert "ACTM_PTW" in civil["statutory_forms_required"]
+    assert set(civil["statutory_forms_required"]) == {"ACTM_PTW", "IRPWM_284_CAUTION"}
+
+
+def test_digital_grant_permit_prefill():
+    """A scheduled block prefills its whole statutory bundle, unsigned."""
+    block = {
+        "block_id": "IR-BLK-2026001", "date": "2026-09-20", "start_time": "01:30",
+        "corridor_id": lrs.CORRIDOR_ID, "line_id": "DN_FAST",
+        "km_start": 19.0, "km_end": 21.0, "span_km": 2.0,
+        "section": "DDR-BA", "section_name": "Dadar - Bandra", "track_id": "DN_FAST",
+        "allocated_duration_mins": 180, "slot_window_mins": 240,
+        "requires_power_block": True, "requires_traffic_block": True,
+        "tasks_bundled": [
+            {"asset_id": "TMS-ENG-1006", "department": "CIVIL",
+             "work_type": "TRACK_TAMPING", "requested_duration_mins": 180,
+             "km_start": 19.0, "km_end": 21.0, "requires_power_block": True,
+             "requires_traffic_block": True, "speed_restriction_psr": 30},
+            {"asset_id": "SMMS-SNT-2011", "department": "SNT",
+             "work_type": "POINT_MACHINE_TEST", "gear_id": "PT-DDR-11",
+             "requested_duration_mins": 60, "km_start": 19.4, "km_end": 19.6,
+             "requires_disconnection": True},
+        ],
+    }
+    permit = build_permits_for_block(block)
+    assert isinstance(permit, DigitalGrantPermit)
+    assert permit.permit_id == "IR-DGP-IR-BLK-2026001"
+    assert permit.status is PermitStatus.PREFILLED
+
+    # ---- the assigned window + the ACTM Para 204 wrap --------------------- #
+    assert permit.earthing.required is True
+    assert permit.earthing.buffer_mins == ACTM_PARA_204_EARTHING_BUFFER_MINS
+    assert permit.possession_mins == 180 + 2 * 15 == permit.earthing.total_possession_mins
+    assert permit.earthing.arithmetic.startswith("180 + 15 + 15 = 210 min")
+    # The granted window is the full blocked period: power off -> power restored.
+    assert permit.window_start == permit.earthing.power_off_at
+    assert permit.window_end == permit.earthing.power_restored_at
+    assert (permit.window_end - permit.window_start).total_seconds() == 210 * 60
+    assert permit.work_start == permit.earthing.work_start
+
+    # ---- 1D identity, so a permit maps back onto the LRS plan ------------ #
+    assert permit.corridor_id == lrs.CORRIDOR_ID and permit.line_id == "DN_FAST"
+    assert permit.lrs_key == [lrs.CORRIDOR_ID, "DN_FAST"]
+    assert has_overlap(permit, permit), "a permit is itself an LRS span"
+    assert permit.span_km == 2.0
+
+    # ---- instruments, derived from the bundled work ---------------------- #
+    assert permit.requires_disconnection is True
+    assert permit.memo_index["T_351"].endswith("/T351")
+    assert set(permit.memo_index) == {"T_351", "T_352", "ACTM_PTW", "IRPWM_284_CAUTION"}
+    assert permit.form_t352.window_start == permit.earthing.power_restored_at
+    assert permit.form_t352.window_end is None, "a reconnection does not expire"
+    assert permit.actm_permit_to_work.earthing.total_possession_mins == 210
+    assert permit.caution_order.speed_restriction_psr == 30
+    assert permit.affected_signalling_gears[0].gear_id == "PT-DDR-11"
+    assert permit.affected_signalling_gears[0].gear_type is permits.GearType.POINT_MACHINE
+
+    # ---- nobody has signed: the optimizer proposes, a human disposes ----- #
+    assert set(permit.unsigned_authorities) == {
+        "SECTION_CONTROLLER", "TRACTION_POWER_CONTROLLER",
+        "STATION_MASTER", "SECTION_ENGINEER",
+    }
+    assert all(s.signed_by is None and s.signed_at is None for s in permit.authorizations)
+    assert permit.actm_permit_to_work.tpc_authorization.status is permits.SignatureStatus.PENDING
+
+    signed = permit.issue(Authority.TRACTION_POWER_CONTROLLER, "TPC Mumbai", employee_id="1234")
+    assert Authority.TRACTION_POWER_CONTROLLER.value not in signed.unsigned_authorities
+    assert signed.status is PermitStatus.PREFILLED, "one signature is not the whole permit"
+    for authority in list(signed.unsigned_authorities):
+        signed = signed.issue(Authority(authority), f"Signed by {authority}")
+    assert signed.status is PermitStatus.ISSUED and not signed.unsigned_authorities
+
+    # JSON round-trip: the permit is the artefact handed to the control desk.
+    json.dumps(permit.model_dump(mode="json"))
+
+
+def test_permit_models_refuse_to_fabricate_or_miscarry():
+    """The output models encode the statutory arithmetic and signature integrity."""
+    # A signature cannot be asserted without a name and a timestamp.
+    for bad in (
+        {"authority": "SECTION_CONTROLLER", "designation": "SC", "status": "SIGNED"},
+        {"authority": "SECTION_CONTROLLER", "designation": "SC", "status": "SIGNED",
+         "signed_by": "X"},
+    ):
+        try:
+            permits.AuthorizationSignature(**bad)
+        except Exception:
+            continue
+        raise AssertionError(f"a fabricated signature was accepted: {bad}")
+
+    # ACTM Para 204 arithmetic is proven, not merely computed.
+    good = permits.build_earthing_buffer("01:30", 90, power_isolation_required=True)
+    assert good.total_possession_mins == 120 and good.buffer_mins == 15
+    try:
+        permits.EarthingBuffer(
+            required=True, buffer_mins=5, work_duration_mins=90, total_possession_mins=100,
+            power_off_at=good.power_off_at, work_start=good.work_start,
+            work_end=good.work_end, power_restored_at=good.power_restored_at,
+            statutory_reference="x",
+        )
+    except Exception:
+        pass
+    else:
+        raise AssertionError("ACTM Para 204 accepted a non-15-minute earthing buffer")
+
+    # No live OHE exposure -> no buffer, and the possession is the work itself.
+    dry = permits.build_earthing_buffer("01:30", 90, power_isolation_required=False)
+    assert dry.buffer_mins == 0 and dry.total_possession_mins == 90
+    assert dry.arithmetic.endswith("ACTM Para 204 not applicable)")
+
+    # Gear classification follows the equipment, then the work type.
+    assert permits.classify_gear("PT-DDR-11") is permits.GearType.POINT_MACHINE
+    assert permits.classify_gear("MSDAC-04") is permits.GearType.AXLE_COUNTER
+    assert permits.classify_gear(None, "SIGNAL_ASPECT_REPLACEMENT") is permits.GearType.SIGNAL
+    assert permits.classify_gear("XYZ") is permits.GearType.UNKNOWN
 
 
 def test_plan_guardrail_detects_conflicts():
@@ -713,13 +898,47 @@ def test_highs_solver_handoff():
     assert result["metrics"]["total_demands"] == len(rows)
     assert result["metrics"]["tasks_scheduled"] >= 1
 
-    # Every scheduled block states its possession in 1D.
+    # Every scheduled block states its possession in 1D and carries the
+    # statutory bundle generated *because* the window now exists.
     for block in result["scheduled_blocks"]:
         for field in LRS_FIELDS:
             assert field in block, f"scheduled block lost the LRS field {field}"
         assert block["line_id"] in lrs.LINE_IDS
         assert block["km_start"] <= block["km_end"]
         assert block["span_km"] == round(block["km_end"] - block["km_start"], 3)
+
+        assert "grant_permit" in block, "a scheduled block must prefill its paperwork"
+        assert block["permit_id"] == f"IR-DGP-{block['block_id']}"
+        grant = block["grant_permit"]
+        assert grant["status"] == PermitStatus.PREFILLED.value
+        assert grant["permit_id"] == block["permit_id"]
+        assert grant["lrs_key"] == [block["corridor_id"], block["line_id"]]
+        # The granted window is the earthing-inclusive possession.
+        assert grant["possession_mins"] == (
+            grant["earthing"]["work_duration_mins"]
+            + 2 * grant["earthing"]["buffer_mins"]
+        )
+        # A Digital Grant Permit always exists and always needs the Sectional
+        # Controller to release it; the specific statutory instruments are
+        # additional, and are legitimately empty when no disconnection, traction
+        # isolation or caution order applies. Raising paperwork nothing requires
+        # would be as wrong as demanding it on the way in.
+        assert "SECTION_CONTROLLER" in grant["unsigned_authorities"]
+        assert len(grant["statutory_references"]) == len(set(grant["statutory_references"])), (
+            "statutory references are deduplicated (T/351 and T/352 share IRSEM Para 22)"
+        )
+        if grant["memo_index"]:
+            assert grant["statutory_references"], "an attached instrument must cite its basis"
+        else:
+            assert grant["statutory_references"] == []
+        # Whatever was generated, the instruments are unsigned placeholders.
+        assert all(
+            signature["signed_by"] is None and signature["signed_at"] is None
+            for signature in grant["authorizations"]
+        )
+        assert block["statutory_forms"] == list(grant["memo_index"] or {}), (
+            "the block's form list and the permit's memo index must agree"
+        )
 
     # The solver's own spatial statement was "no two colliding chainage intervals
     # share a slot", so an independent 1D re-check must find nothing to object to.
@@ -765,7 +984,10 @@ def main():  # pragma: no cover - CLI report runner
         ("Frozen contract + LRS identity + silo alias normalisation", test_contract_fields_and_aliases),
         ("Contract rejects out-of-corridor / malformed chainage", test_contract_rejects_unsafe_chainage),
         ("ACTM Para 204: 15-minute earthing buffer arithmetic", test_actm_para_204_earthing_buffer),
-        ("IRSEM Para 22: Form T/351 + T/352 generation", test_irsem_form_t351_disconnection),
+        ("Statutory memos are outputs, not input gates", test_statutory_memos_are_outputs_not_inputs),
+        ("IRSEM Para 22 / ACTM instruments prefilled from the block", test_permit_bundle_is_prefilled_from_the_memo_side),
+        ("DigitalGrantPermit: window + earthing + gear prefill, unsigned", test_digital_grant_permit_prefill),
+        ("Permit models refuse fabricated signatures / bad Para 204 arithmetic", test_permit_models_refuse_to_fabricate_or_miscarry),
         ("Plan guardrail: 1D chainage exclusivity + power isolation envelope", test_plan_guardrail_detects_conflicts),
         ("Ingestion layer: 50 CRIS requisitions validated", test_reference_feed_ingests_cleanly),
         ("Malformed payloads quarantined, never leaked", test_malformed_corpus_never_leaks),

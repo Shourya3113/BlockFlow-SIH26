@@ -283,9 +283,9 @@
     },
     {
       "case_id": "SNT_DISCONNECTION_WITHOUT_FORM",
-      "rule": "IRSEM_22_T351_DISCONNECTION",
+      "rule": "DISCONNECTION_GEAR_IDENTIFIED",
       "expect": "ACCEPT_BUT_FLAGGED",
-      "why": "Point machine work with no Form T/351 reference; IRSEM Para 22 paperwork is mandatory.",
+      "why": "A missing Form T/351 reference is NOT a defect - a memo issued only after the block is authorised cannot be cited on the way in. What the flag catches is the real engineering gap: the work puts signalling gear out of service (DISCONNECTION=Y, WORK_TYPE=POINT_MACHINE_TEST) but names no gear, so Form T/351 cannot be prefilled downstream.",
       "payload": {
         "REQ_NO": "WARN-003",
         "DEPT": "S&T",
@@ -338,7 +338,7 @@
       "case_id": "BOOLEAN_SPELLINGS",
       "rule": "BOOLEAN_COERCION",
       "expect": "ACCEPT",
-      "why": "Booleans arrive as Y / YES / 1 / TRUE depending on the silo; all must coerce.",
+      "why": "Booleans arrive as Y / YES / 1 / TRUE depending on the silo; all must coerce. The gear is named because a declared disconnection must be able to raise its Form T/351 downstream.",
       "payload": {
         "REQ_NO": "OK-003",
         "DEPT": "S&T",
@@ -348,6 +348,7 @@
         "MINUTES": "90",
         "SEVERITY": "URGENT",
         "DISCONNECTION": 1,
+        "GEAR_ID": "PT-VR-45",
         "STATUTORY_FORM": "T/351",
         "POWER_BLOCK": "YES"
       }

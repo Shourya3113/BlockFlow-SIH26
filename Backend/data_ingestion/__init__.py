@@ -25,6 +25,11 @@ Modules
 ``safety``      ACTM Vol II Para 203/204 (15-minute earthing buffers), IRSEM
                 Para 22 (Form T/351 / T/352), IRPWM 268(b) PSR invariants, and
                 the 1D chainage-exclusivity plan guardrail.
+``permits``     The **downstream** statutory paperwork. Derives which
+                instruments a block needs from its engineering attributes, and
+                prefills Form T/351, Form T/352, the ACTM Permit-to-Work and
+                the IRPWM 284 caution order once a window has been allocated.
+                Memos are outputs, never input validation gates.
 ``pipeline``    The normaliser that collapses heterogeneous silo payloads into
                 the LRS contract and emits PM Gati Shakti GeoJSON.
 ``tms_data``    Track Management System silo (P-Way, USFD flaws, geometry).
@@ -45,9 +50,42 @@ Typical use
 {'CIVIL': 20, 'SNT': 15, 'TRD': 15}
 >>> has_overlap(rows[0], rows[1])              # the whole spatial solver test
 False
+
+Statutory memos are generated, not required
+-------------------------------------------
+A requisition carries engineering attributes only. Once the optimizer allocates
+a window, :func:`Backend.data_ingestion.permits.build_permits_for_block`
+prefills the IRSEM Form T/351 / T/352, the ACTM Permit-to-Work with its Para 204
+earthing wrap, and the caution order - unsigned, for the competent authority to
+release.
+
+>>> from Backend.data_ingestion import build_permits_for_block
+>>> permit = build_permits_for_block(scheduled_block)
+>>> permit.memo_index
+{'T_351': 'IR-DGP-IR-BLK-2026001/T351', 'T_352': '.../T352', 'ACTM_PTW': '.../PTW'}
 """
 
-from . import coa_data, lrs, pipeline, safety, schema, smms_data, spatial, tdms_data, tms_data, waypoints
+from . import coa_data, lrs, permits, pipeline, safety, schema, smms_data, spatial, tdms_data, tms_data, waypoints
+from .permits import (
+    ACTMPermitToWork,
+    AffectedSignallingGear,
+    Authority,
+    AuthorizationSignature,
+    DigitalGrantPermit,
+    EarthingBuffer,
+    FormCode,
+    FormT351Notice,
+    FormT352Notice,
+    GearAction,
+    GearType,
+    IRPWM284CautionOrder,
+    PermitRequirements,
+    PermitStatus,
+    SignatureStatus,
+    build_permits_for_block,
+    build_permits_for_requisition,
+    derive_permit_requirements,
+)
 from .lrs import (
     CORRIDOR_ID,
     LINE_IDS,
@@ -80,7 +118,6 @@ from .schema import (
     Line,
     Severity,
     SpatialFix,
-    StatutoryForm,
 )
 from .safety import (
     ACTM_PARA_204_EARTHING_BUFFER_MINS,
@@ -94,6 +131,7 @@ from .waypoints import CORRIDOR, CORRIDOR_SECTIONS, STATION_GROUND_CONTROL, WAYP
 __all__ = [
     "coa_data",
     "lrs",
+    "permits",
     "pipeline",
     "safety",
     "schema",
@@ -132,7 +170,25 @@ __all__ = [
     "Line",
     "Severity",
     "SpatialFix",
-    "StatutoryForm",
+    # permits
+    "ACTMPermitToWork",
+    "AffectedSignallingGear",
+    "Authority",
+    "AuthorizationSignature",
+    "DigitalGrantPermit",
+    "EarthingBuffer",
+    "FormCode",
+    "FormT351Notice",
+    "FormT352Notice",
+    "GearAction",
+    "GearType",
+    "IRPWM284CautionOrder",
+    "PermitRequirements",
+    "PermitStatus",
+    "SignatureStatus",
+    "build_permits_for_block",
+    "build_permits_for_requisition",
+    "derive_permit_requirements",
     # safety
     "ACTM_PARA_204_EARTHING_BUFFER_MINS",
     "evaluate_safety_invariants",

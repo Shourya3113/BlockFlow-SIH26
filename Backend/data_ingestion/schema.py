@@ -73,7 +73,7 @@ from .lrs import (
     LinearSpan,
     find_collisions,
 )
-from .safety import ACTM_PARA_204_EARTHING_BUFFER_MINS
+from .permits import ACTM_PARA_204_EARTHING_BUFFER_MINS, FormCode, coerce_form_code
 
 #: The frozen five-field contract other modules may rely on.
 CONTRACT_FIELDS: List[str] = ["asset_id", "dept", "km_start", "km_end", "aci"]
@@ -94,9 +94,12 @@ CONTRACT_ALIASES: Dict[str, Tuple[str, ...]] = {
     "line_id": ("line", "track", "track_id", "running_line", "road"),
     "km_start": ("km_from", "from_km"),
     "km_end": ("km_to", "to_km"),
-    "duration_mins": ("duration", "minutes"),
+    "requested_duration_mins": ("duration_mins", "duration", "minutes"),
     "urgency": ("severity", "priority"),
-    "statutory_form": ("form",),
+    "work_type": ("defect_type", "maintenance_type", "activity", "nature_of_defect", "job_type"),
+    "fault_code": ("defect_code", "flaw_code", "failure_code", "fm_code"),
+    "speed_restriction_psr": ("psr_speed_kmph", "psr_speed", "psr", "speed_restriction"),
+    "referenced_form": ("statutory_form", "form", "form_no"),
     "aci": ("aci_score",),
 }
 
@@ -157,17 +160,12 @@ class Severity(str, Enum):
     ROUTINE = "ROUTINE"     # P3
 
 
-class StatutoryForm(str, Enum):
-    """Railway statutory paperwork referenced by a requisition."""
-
-    T_351 = "T_351"            # IRSEM - S&T disconnection notice
-    T_352 = "T_352"            # IRSEM - S&T reconnection notice
-    ACTM_203 = "ACTM_203"      # ACTM Vol II Para 203 - TPC isolation
-    ACTM_204 = "ACTM_204"      # ACTM Vol II Para 204 - 15-min earthing buffer
-    IRPWM_268B = "IRPWM_268B"  # Permanent speed restriction
-    IRPWM_284 = "IRPWM_284"    # P-Way work under traffic
-    IRSEM_22 = "IRSEM_22"      # Form T/351 disconnection
-    NONE = "NONE"
+# NOTE: there is deliberately no ``StatutoryForm`` enum on the requisition
+# contract any more. Form T/351, Form T/352 and the ACTM Permit-to-Work are
+# *outputs* of a scheduled block, not inputs to one - see
+# :mod:`Backend.data_ingestion.permits`, which owns :class:`~permits.FormCode`.
+# A form cited on an incoming row is recorded as provenance on
+# :attr:`BlockRequisition.referenced_form` and is never a validation gate.
 
 
 #: Silo spellings -> canonical department. Keys are upper-cased before lookup.
@@ -203,22 +201,9 @@ SEVERITY_ALIASES: Dict[str, Severity] = {
     "NORMAL": Severity.ROUTINE, "PLANNED": Severity.ROUTINE,
 }
 
-FORM_ALIASES: Dict[str, StatutoryForm] = {
-    "T_351": StatutoryForm.T_351, "T/351": StatutoryForm.T_351,
-    "T351": StatutoryForm.T_351, "FORM T/351": StatutoryForm.T_351,
-    "FORM T-351": StatutoryForm.T_351, "IRSEM_22": StatutoryForm.IRSEM_22,
-    "IRSEM 22": StatutoryForm.IRSEM_22,
-    "T_352": StatutoryForm.T_352, "T/352": StatutoryForm.T_352,
-    "T352": StatutoryForm.T_352, "FORM T/352": StatutoryForm.T_352,
-    "ACTM_203": StatutoryForm.ACTM_203, "ACTM 203": StatutoryForm.ACTM_203,
-    "ACTM203": StatutoryForm.ACTM_203, "ACTM_PARA_203": StatutoryForm.ACTM_203,
-    "ACTM_204": StatutoryForm.ACTM_204, "ACTM 204": StatutoryForm.ACTM_204,
-    "ACTM204": StatutoryForm.ACTM_204, "ACTM_PARA_204": StatutoryForm.ACTM_204,
-    "IRPWM_268B": StatutoryForm.IRPWM_268B, "IRPWM 268B": StatutoryForm.IRPWM_268B,
-    "IRPWM_284": StatutoryForm.IRPWM_284, "IRPWM 284": StatutoryForm.IRPWM_284,
-    "": StatutoryForm.NONE, "NONE": StatutoryForm.NONE, "NA": StatutoryForm.NONE,
-    "N/A": StatutoryForm.NONE, "NOT REQUIRED": StatutoryForm.NONE,
-}
+#: Form spellings are folded onto :class:`~Backend.data_ingestion.permits.FormCode`
+#: by :func:`~Backend.data_ingestion.permits.coerce_form_code` - one table, in
+#: the module that actually issues the documents.
 
 
 def _lookup(alias_map: Dict[str, Any], value: Any, label: str) -> Any:
@@ -337,9 +322,18 @@ class BlockRequisition(LinearSpan):
     requisition is natively a 1D linear-referencing span and two of them can be
     tested for physical collision without leaving the chainage domain.
 
-    ``asset_id``, ``dept`` and ``aci`` complete the frozen five-field contract;
-    the remaining fields carry the physical and statutory context the optimizer
-    and the safety engine need.
+    **Inputs are engineering attributes.** The fields the silos actually own -
+    ``asset_id``, ``dept``, ``line_id``, ``km_start``/``km_end``,
+    ``work_type``/``fault_code``, ``requested_duration_mins``,
+    ``speed_restriction_psr``, ``urgency`` - describe *what work, where, how
+    long, how urgent*. Nothing here asks whether a Form T/351 has been issued,
+    because a memo issued for a block that is still a proposal cannot exist.
+    The statutory instruments are generated downstream by
+    :mod:`Backend.data_ingestion.permits`, once a window has been allocated.
+
+    ``asset_id``, ``dept`` and ``aci`` complete the frozen five-field contract.
+    ``referenced_form`` keeps any form number a silo did cite, as provenance for
+    the audit trail only.
     """
 
     model_config = ConfigDict(
@@ -364,8 +358,48 @@ class BlockRequisition(LinearSpan):
         description="Asset Criticality Index 0-100; None until the ACI engine scores it",
     )
 
-    # ---- physical / operational ------------------------------------------- #
-    duration_mins: int = Field(ge=MIN_DURATION_MINS, le=MAX_DURATION_MINS)
+    # ---- engineering attributes (what work, where, how long) -------------- #
+    requested_duration_mins: int = Field(
+        ge=MIN_DURATION_MINS,
+        le=MAX_DURATION_MINS,
+        validation_alias=AliasChoices(
+            "requested_duration_mins", "duration_mins", "duration", "minutes",
+            "allotted_mins", "block_duration", "time_required", "demand_minutes",
+        ),
+        serialization_alias="requested_duration_mins",
+        description=(
+            "On-track time the field unit is asking for, minutes. Distinct from "
+            "the duration the optimizer eventually allocates."
+        ),
+    )
+    work_type: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "work_type", "defect_type", "flaw_type", "maintenance_type", "activity",
+            "nature_of_defect", "job_type",
+        ),
+        serialization_alias="work_type",
+        description="Engineering activity, e.g. USFD_IMR_WELD, POINT_MACHINE_TEST",
+    )
+    fault_code: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "fault_code", "flaw_code", "defect_code", "failure_code", "fm_code",
+        ),
+        serialization_alias="fault_code",
+        description="Coded failure/defect classification from the source silo",
+    )
+    speed_restriction_psr: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=160,
+        validation_alias=AliasChoices(
+            "speed_restriction_psr", "psr_speed_kmph", "psr_speed", "psr",
+            "speed_restriction", "temporary_speed", "psr_kmph",
+        ),
+        serialization_alias="speed_restriction_psr",
+        description="IRPWM Para 268(b) permanent speed restriction, km/h",
+    )
     urgency: Severity = Field(
         default=Severity.ROUTINE,
         validation_alias=AliasChoices("urgency", "severity", "priority"),
@@ -374,7 +408,6 @@ class BlockRequisition(LinearSpan):
 
     # ---- provenance ------------------------------------------------------- #
     system: Optional[str] = Field(default=None, description="Source silo: TMS/SMMS/TDMS/COA")
-    defect_type: Optional[str] = None
     description: Optional[str] = None
     defect_id: Optional[str] = Field(
         default=None,
@@ -382,14 +415,30 @@ class BlockRequisition(LinearSpan):
     )
     reported_date: Optional[str] = None
     status: str = "PENDING"
+    referenced_form: Optional[FormCode] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "referenced_form", "statutory_form", "form", "form_no",
+            "disconnection_form", "ptw_form", "irsem_form", "actm_form",
+        ),
+        serialization_alias="referenced_form",
+        description=(
+            "A statutory form number the silo happened to cite. PROVENANCE ONLY: "
+            "never validated, never required. The instruments that must exist are "
+            "derived from the engineering attributes and generated after scheduling."
+        ),
+    )
 
-    # ---- statutory -------------------------------------------------------- #
-    statutory_form: Optional[StatutoryForm] = None
+    # ---- operating context (declared by the field unit / silo) ------------ #
     requires_traffic_block: bool = True
     requires_power_block: bool = False
     requires_disconnection: bool = Field(
         default=False,
-        description="True when S&T gear must be proved disconnected (IRSEM Form T/351)",
+        description=(
+            "True when the work puts signalling gear out of service. Drives the "
+            "IRSEM Form T/351 + T/352 requirement - the notice itself is generated "
+            "downstream, never demanded here."
+        ),
     )
     requires_earthing_buffer: bool = Field(
         default=True,
@@ -398,7 +447,6 @@ class BlockRequisition(LinearSpan):
 
     # ---- risk inputs consumed by the ACI engine --------------------------- #
     safety_weight: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    psr_speed_kmph: Optional[int] = Field(default=None, ge=0, le=160)
     days_overdue: int = Field(default=0, ge=0)
     target_completion_days: Optional[int] = Field(default=None, ge=1, le=90)
     gmt: Optional[float] = Field(default=None, ge=0.0)
@@ -465,14 +513,27 @@ class BlockRequisition(LinearSpan):
     def _normalise_urgency(cls, value: Any) -> Any:
         return _lookup(SEVERITY_ALIASES, value, "urgency")
 
-    @field_validator("statutory_form", mode="before")
+    @field_validator("referenced_form", mode="before")
     @classmethod
-    def _normalise_form(cls, value: Any) -> Any:
+    def _normalise_referenced_form(cls, value: Any) -> Any:
+        """Record a cited form number, or ``None``. Never raises.
+
+        An unrecognised or explicit ``NONE`` reference is simply not recorded:
+        it must never reject a requisition, which is precisely the coupling
+        this field replaces.
+        """
+        return coerce_form_code(value)
+
+    @field_validator("work_type", "fault_code", mode="before")
+    @classmethod
+    def _normalise_engineering_code(cls, value: Any) -> Any:
+        """Canonical upper-snake form of a work type / fault code."""
         if value is None:
             return None
-        return _lookup(FORM_ALIASES, value, "statutory_form")
+        text = re.sub(r"[^A-Z0-9]+", "_", str(value).strip().upper()).strip("_")
+        return text or None
 
-    @field_validator("duration_mins", mode="before")
+    @field_validator("requested_duration_mins", mode="before")
     @classmethod
     def _normalise_duration(cls, value: Any) -> Any:
         return _to_minutes(value)
@@ -541,6 +602,21 @@ class BlockRequisition(LinearSpan):
     #  Derived properties
     # ------------------------------------------------------------------ #
     # ``span_km`` and ``lrs_key`` are inherited from LinearSpan.
+
+    @property
+    def duration_mins(self) -> int:
+        """Legacy read alias of :attr:`requested_duration_mins`."""
+        return self.requested_duration_mins
+
+    @property
+    def defect_type(self) -> Optional[str]:
+        """Legacy read alias of :attr:`work_type`."""
+        return self.work_type
+
+    @property
+    def psr_speed_kmph(self) -> Optional[int]:
+        """Legacy read alias of :attr:`speed_restriction_psr`."""
+        return self.speed_restriction_psr
 
     @property
     def line(self) -> Line:
@@ -642,15 +718,44 @@ class BlockRequisition(LinearSpan):
             "projection_only": True,
         }
 
+    # ------------------------------------------------------------------ #
+    #  Downstream statutory paperwork (outputs, never inputs)
+    # ------------------------------------------------------------------ #
+    def permit_requirements(self) -> "PermitRequirements":
+        """
+        Which statutory instruments this requisition will pull in once scheduled.
+
+        Derived from engineering attributes and the declared operating context -
+        no memo is required *of* the requisition. See
+        :func:`Backend.data_ingestion.permits.derive_permit_requirements`.
+        """
+        from .permits import derive_permit_requirements
+
+        return derive_permit_requirements(self.model_dump(mode="json"))
+
+    def provisional_permit(self) -> "DigitalGrantPermit":
+        """
+        *Preview* the permit bundle this work will attract.
+
+        Windows are placeholders until the optimizer allocates a block, and the
+        result is always unsigned. Useful for pre-schedule review and for
+        confirming the engineering description is complete enough to raise the
+        paperwork later.
+        """
+        from .permits import build_permits_for_requisition
+
+        return build_permits_for_requisition(self.model_dump(mode="json"))
+
     def to_contract_dict(self) -> Dict[str, Any]:
         """The frozen five fields, the LRS key, and provenance as a plain dict."""
         payload = self.model_dump(mode="json")
         return {key: payload.get(key) for key in CONTRACT_FIELDS} | {
             **self.to_lrs_dict(),
             "urgency": self.urgency.value,
-            "duration_mins": self.duration_mins,
+            "requested_duration_mins": self.requested_duration_mins,
+            "work_type": self.work_type,
             "system": self.system,
-            "statutory_form": self.statutory_form.value if self.statutory_form else None,
+            "referenced_form": self.referenced_form.value if self.referenced_form else None,
             "section": self.section,
         }
 
@@ -667,16 +772,24 @@ class BlockRequisition(LinearSpan):
         ``section`` and ``track_id`` survive only because the legacy optimizer
         and the COA disruption model still key their reporting on them.
 
+        Field naming: the contract's new engineering-attribute names are the
+        canonical ones, and the legacy spellings the optimizer already reads are
+        emitted alongside them (``requested_duration_mins`` *and*
+        ``duration_mins``, ``work_type`` *and* ``defect_type``,
+        ``speed_restriction_psr`` *and* ``psr_speed_kmph``) so this bridge can
+        be retired field-by-field rather than as one flag day.
+
         Three durations travel with every row so the corridor footprint can
         never be misread:
 
-        * ``duration_mins`` - working duration (the existing optimizer's field).
+        * ``requested_duration_mins`` - what the field unit asked for.
+        * ``duration_mins`` / ``work_duration_mins`` - the same value under the
+          legacy optimizer's names.
         * ``possession_duration_mins`` - ``work + 2 x 15 min`` ACTM Para 204
           earthing buffer when live OHE work applies; this is the real time the
           section is blocked.
-        * ``work_duration_mins`` / ``earthing_buffer_mins`` - the arithmetic
-          behind it, so the safety guardrail can re-derive the envelope instead
-          of trusting an opaque total.
+        * ``earthing_buffer_mins`` - the arithmetic behind it, so the safety
+          guardrail can re-derive the envelope instead of trusting a total.
         """
         buffer_mins = (
             ACTM_PARA_204_EARTHING_BUFFER_MINS
@@ -699,24 +812,31 @@ class BlockRequisition(LinearSpan):
             "km_start": self.km_start,
             "km_end": self.km_end,
             "span_km": self.span_km,
-            "defect_type": self.defect_type,
+            # ---- engineering attributes (new names + legacy aliases) ------ #
+            "work_type": self.work_type,
+            "defect_type": self.work_type,
+            "fault_code": self.fault_code,
             "description": self.description,
             "severity": self.urgency.value,
             "urgency": self.urgency.value,
             "priority_tier": self.priority_tier,
-            "duration_mins": self.duration_mins,
-            "work_duration_mins": self.duration_mins,
+            "requested_duration_mins": self.requested_duration_mins,
+            "duration_mins": self.requested_duration_mins,
+            "work_duration_mins": self.requested_duration_mins,
             "earthing_buffer_mins": buffer_mins,
-            "possession_duration_mins": self.duration_mins + 2 * buffer_mins,
+            "possession_duration_mins": self.requested_duration_mins + 2 * buffer_mins,
             "safety_weight": self.safety_weight if self.safety_weight is not None else 0.5,
-            "psr_speed_kmph": self.psr_speed_kmph,
+            "speed_restriction_psr": self.speed_restriction_psr,
+            "psr_speed_kmph": self.speed_restriction_psr,
             "days_overdue": self.days_overdue,
             "target_completion_days": self.target_completion_days or 7,
             "gmt": self.gmt if self.gmt is not None else (waypoints.section_definition(self.section or "") or {}).get("gmt", 65),
             "requires_traffic_block": self.requires_traffic_block,
             "requires_power_block": self.requires_power_block,
             "requires_disconnection": self.requires_disconnection,
-            "statutory_form": self.statutory_form.value if self.statutory_form else None,
+            # Provenance only. The instruments that must be raised are derived
+            # downstream and are NOT carried as a requirement on this row.
+            "referenced_form": self.referenced_form.value if self.referenced_form else None,
             "status": self.status,
             "reported_date": self.reported_date,
         }
@@ -870,7 +990,7 @@ __all__ = [
     "LineId",
     "LinearSpan",
     "Severity",
-    "StatutoryForm",
+    "FormCode",
     "DisplayProjection",
     "SpatialFix",
     "BlockRequisition",

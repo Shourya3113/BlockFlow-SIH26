@@ -84,9 +84,11 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
         "line_id", "line", "track", "track_id", "running_line", "line_no", "road",
         "track_no", "up_dn",
     ),
-    "duration_mins": (
-        "duration_mins", "duration", "duration_minutes", "allotted_mins",
-        "minutes", "block_duration", "time_required", "demand_minutes",
+    #: On-track time the field unit is asking for. Distinct from the duration the
+    #: optimizer later allocates, which is why the contract name says "requested".
+    "requested_duration_mins": (
+        "requested_duration_mins", "duration_mins", "duration", "duration_minutes",
+        "allotted_mins", "minutes", "block_duration", "time_required", "demand_minutes",
     ),
     "urgency": (
         "urgency", "severity", "priority", "criticality", "class", "grade",
@@ -94,9 +96,12 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "aci": (
         "aci", "aci_score", "aci_value", "criticality_index", "risk_score",
     ),
-    "statutory_form": (
-        "statutory_form", "form", "form_no", "disconnection_form", "ptw_form",
-        "irsem_form", "actm_form",
+    #: A statutory form number a silo happened to cite. Recorded as provenance and
+    #: nothing else - see Backend.data_ingestion.permits for why memos cannot be
+    #: validated as inputs.
+    "referenced_form": (
+        "referenced_form", "statutory_form", "form", "form_no", "disconnection_form",
+        "ptw_form", "irsem_form", "actm_form",
     ),
     "requires_power_block": (
         "requires_power_block", "power_block", "ohe_power_block", "ohe_required",
@@ -111,15 +116,19 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
         "disconnection_required", "snt_disconnection",
     ),
     "system": ("system", "source_system", "silo", "source"),
-    "defect_type": (
-        "defect_type", "flaw_type", "work_type", "maintenance_type",
+    #: Engineering attributes: what work is being asked for, and its coded fault.
+    "work_type": (
+        "work_type", "defect_type", "flaw_type", "maintenance_type",
         "activity", "nature_of_defect", "job_type",
+    ),
+    "fault_code": (
+        "fault_code", "flaw_code", "defect_code", "failure_code", "fm_code",
     ),
     "description": ("description", "remarks", "observation", "details", "note"),
     "safety_weight": ("safety_weight", "safety_factor", "risk_weight"),
-    "psr_speed_kmph": (
-        "psr_speed_kmph", "psr_speed", "psr", "speed_restriction",
-        "temporary_speed", "psr_kmph",
+    "speed_restriction_psr": (
+        "speed_restriction_psr", "psr_speed_kmph", "psr_speed", "psr",
+        "speed_restriction", "temporary_speed", "psr_kmph",
     ),
     "days_overdue": ("days_overdue", "overdue_days", "ageing_days", "delay_days"),
     "target_completion_days": (
@@ -363,7 +372,7 @@ def requisition_geojson_feature(requisition: BlockRequisition) -> Dict[str, Any]
 
     start_fix = requisition.display_start
     window = safety.compute_earthing_window(
-        None, requisition.duration_mins, requisition.power_isolation_required
+        None, requisition.requested_duration_mins, requisition.power_isolation_required
     )
     properties = {
         # ---- authoritative 1D identity ---------------------------------- #
@@ -376,11 +385,16 @@ def requisition_geojson_feature(requisition: BlockRequisition) -> Dict[str, Any]
         "line": requisition.line_id,
         "section": requisition.section,
         "section_name": requisition.section_name,
-        "duration_mins": requisition.duration_mins,
+        "requested_duration_mins": requisition.requested_duration_mins,
+        "work_type": requisition.work_type,
+        "fault_code": requisition.fault_code,
+        "speed_restriction_psr": requisition.speed_restriction_psr,
         "urgency": requisition.urgency.value,
         "priority_tier": requisition.priority_tier,
         "aci": requisition.aci,
-        "statutory_form": requisition.statutory_form.value if requisition.statutory_form else None,
+        # Provenance: what the silo cited, if anything. The instruments that must
+        # exist are generated downstream by permits.build_permits_for_block.
+        "referenced_form": requisition.referenced_form.value if requisition.referenced_form else None,
         "requires_power_block": requisition.requires_power_block,
         "requires_traffic_block": requisition.requires_traffic_block,
         "requires_disconnection": requisition.requires_disconnection,

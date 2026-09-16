@@ -84,11 +84,11 @@ Expected output:
       "km_start": 19.4,
       "km_end": 21.2,
       "line": "DN_FAST",
-      "duration_mins": 180,
-      "flaw_type": "USFD_IMR",
-      "psr_speed": 30,
-      "overdue_days": 4,
-      "statutory_form": "IRPWM_284"
+      "requested_duration_mins": 180,
+      "work_type": "USFD_IMR_WELD",
+      "fault_code": "USFD_IMR",
+      "speed_restriction_psr": 30,
+      "overdue_days": 4
     },
     {
       "asset_id": "SMMS-SNT-2012",
@@ -96,9 +96,11 @@ Expected output:
       "km_start": 19.8,
       "km_end": 20.2,
       "line": "DN_FAST",
-      "duration_mins": 90,
-      "point_no": "104B",
-      "statutory_form": "T_351"
+      "requested_duration_mins": 90,
+      "work_type": "POINT_MACHINE_TEST",
+      "fault_code": "PM_OBSTRUCTION",
+      "gear_id": "104B",
+      "requires_disconnection": true
     },
     {
       "asset_id": "TDMS-TRD-1003",
@@ -106,14 +108,22 @@ Expected output:
       "km_start": 19.0,
       "km_end": 22.0,
       "line": "DN_FAST",
-      "duration_mins": 120,
+      "requested_duration_mins": 120,
+      "work_type": "CONTACT_WIRE_HOTSPOT",
+      "fault_code": "OHE_HOTSPOT",
       "hotspot_temp_c": 84.5,
-      "feeding_post": "JOS",
-      "statutory_form": "ACTM_203"
+      "feeding_post": "JOS"
     }
   ]
 }
 ```
+
+> **Inputs are engineering, not statutory.** A requisition says *what work, where, how long, how urgent*.
+> It **must not** carry a `statutory_form` (Form T/351, Form T/352, ACTM PTW): those are legal instruments a
+> Sectional Controller or Traction Power Controller issues only **after** a block has been scheduled and
+> authorised, so a prospective requisition cannot hold one. BlockFlow derives which instruments the work
+> will need (from `work_type`, the directorate and the declared operating context) and prefills them
+> downstream, once the optimizer has allocated a window.
 
 * **Sample Response Payload:**
 ```json

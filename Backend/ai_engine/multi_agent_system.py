@@ -214,6 +214,10 @@ class SNTAgent(AgentDeliberation):
             "department": self.department,
             "urgency_bid": 0.85 if demand.get("severity") == "CRITICAL" else 0.60,
             "required_disconnection_mins": demand.get("duration_mins", 90),
+            # These instruments are *requirements derived* from the work type. The
+            # notices themselves are prefilled by Backend.data_ingestion.permits
+            # once a block window has been allocated, then signed by the Sectional
+            # Controller; no memo is demanded of the incoming requisition.
             "statutory_forms": [
                 "IRSEM Para 22: Form T/351 Disconnection Notice to Sectional Controller",
                 "Form T/352 Reconnection Notice upon digital point detection test"

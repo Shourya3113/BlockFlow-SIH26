@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 from .prioritizer import AssetCriticalityPrioritizer
 from ..data_ingestion import lrs
 from ..data_ingestion.coa_data import get_corridor_slots, evaluate_slot_disruption
+from ..data_ingestion.permits import build_permits_for_block
 
 #: Two demands on the same running line whose chainage intervals are this close
 #: (or overlap) can share one isolation and therefore one joint possession.
@@ -398,6 +399,22 @@ class IntegratedBlockOptimizer:
                             "approval_status": "PROPOSED",
                             "ai_confidence_pct": round(92.0 + np.random.uniform(2.0, 7.0), 1)
                         }
+
+                        # ---- downstream statutory paperwork ----------------- #
+                        # The block now has a window, so the memos can finally
+                        # exist: Form T/351 / T/352, the ACTM Permit-to-Work with
+                        # its Para 204 earthing wrap, and the caution order are
+                        # prefilled here and left UNSIGNED for the competent
+                        # authority. Nothing on the inbound requisition asked
+                        # for them - they are derived from the work itself.
+                        grant = build_permits_for_block(block_record)
+                        block_record["permit_id"] = grant.permit_id
+                        block_record["statutory_forms"] = [
+                            memo.form_code.value for memo in grant.memos
+                        ]
+                        block_record["earthing_buffer_mins"] = grant.earthing.buffer_mins
+                        block_record["possession_mins"] = grant.possession_mins
+                        block_record["grant_permit"] = grant.model_dump(mode="json")
                         scheduled_blocks.append(block_record)
 
         # Sort scheduled blocks by date & start time
@@ -428,6 +445,13 @@ class IntegratedBlockOptimizer:
             "joint_coordination_pct": joint_ratio,
             "track_downtime_saved_hours": total_saved_hours,
             "critical_safety_resolved": f"{critical_resolved}/{critical_total}",
+            "statutory_forms_generated": sum(
+                len(b.get("statutory_forms") or []) for b in scheduled_blocks
+            ),
+            "permits_awaiting_signature": sum(
+                1 for b in scheduled_blocks
+                if (b.get("grant_permit") or {}).get("status") == "PREFILLED"
+            ),
             "asset_availability_pct": round(95.0 + min(4.5, (total_saved_hours * 0.4)), 1),
             "solver_engine": "SciPy HiGHS Mixed-Integer Linear Programming + Shadow Bundler"
         }
@@ -458,5 +482,11 @@ if __name__ == "__main__":
     if result['scheduled_blocks']:
         first_b = result['scheduled_blocks'][0]
         print(f"\nSample Block: {first_b['block_id']} on {first_b['date']} ({first_b['start_time']}-{first_b['end_time']})")
-        print(f"  Section: {first_b['section']} {first_b['track_id']} | Depts: {first_b['departments']}")
+        print(f"  LRS: {first_b['corridor_id']} / {first_b['line_id']} km {first_b['km_start']}-{first_b['km_end']}")
         print(f"  Bundled Tasks: {first_b['task_count']} | Saved: {first_b['downtime_saved_mins']} mins")
+        permit = first_b["grant_permit"]
+        print(f"  Permit: {permit['permit_id']} [{permit['status']}]")
+        print(f"  Window: {permit['window_start']} -> {permit['window_end']}")
+        print(f"  Earthing: {permit['earthing']['arithmetic']}")
+        print(f"  Forms : {first_b['statutory_forms']}")
+        print(f"  Unsigned authorities: {permit['unsigned_authorities']}")
