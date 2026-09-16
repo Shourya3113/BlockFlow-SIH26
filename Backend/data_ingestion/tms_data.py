@@ -117,7 +117,41 @@ def generate_tms_defects(count: int = 25, seed: int = 42) -> List[Dict[str, Any]
 
     return defects
 
+# --------------------------------------------------------------------------- #
+#  CRIS TMS ingestion entry points
+# --------------------------------------------------------------------------- #
+def parse_tms_payload(payload, scorer=None):
+    """
+    Ingest a raw CRIS **TMS** (P-Way / Civil) feed into the unified contract.
+
+    Accepts ``{"requisitions": [...]}``, a bare list, or a single record, and
+    returns an :class:`~Backend.data_ingestion.schema.IngestReport` holding the
+    accepted requisitions (spatially snapped, statutory-checked), the rejected
+    ones with reasons, and the PM Gati Shakti GeoJSON.
+    """
+    from .pipeline import ingest_feed
+
+    return ingest_feed(payload, source="TMS", scorer=scorer)
+
+
+def normalize_tms_defect(defect):
+    """Convert one synthetic/legacy TMS defect dict into a BlockRequisition."""
+    from .pipeline import normalize_legacy_defect
+
+    return normalize_legacy_defect(defect, source="TMS")
+
+
 if __name__ == "__main__":
     data = generate_tms_defects(10)
     print(f"Generated {len(data)} sample TMS defects.")
     print("Sample record:", data[0])
+
+    requisition = normalize_tms_defect(data[0])
+    print(
+        f"Normalised      : {requisition.asset_id} [{requisition.dept.value}] "
+        f"km {requisition.km_start}-{requisition.km_end} on {requisition.line.value}"
+    )
+    print(
+        f"Snapped to      : {requisition.geo_start.lon}, {requisition.geo_start.lat} "
+        f"({requisition.geo_start.nearest_waypoint_id}, section {requisition.section})"
+    )

@@ -115,7 +115,38 @@ def generate_tdms_defects(count: int = 20, seed: int = 44) -> List[Dict[str, Any
 
     return items
 
+# --------------------------------------------------------------------------- #
+#  CRIS TDMS ingestion entry points
+# --------------------------------------------------------------------------- #
+def parse_tdms_payload(payload, scorer=None):
+    """
+    Ingest a raw CRIS **TDMS** (Traction Distribution) feed.
+
+    Every 25 kV job is normalised to ``requires_power_block: true`` unless the
+    silo explicitly states otherwise, so the ACTM Vol II Para 203/204 invariant
+    (TPC isolation + 15-minute earthing buffers) always has a window to attach
+    itself to.
+    """
+    from .pipeline import ingest_feed
+
+    return ingest_feed(payload, source="TDMS", scorer=scorer)
+
+
+def normalize_tdms_defect(defect):
+    """Convert one synthetic/legacy TDMS defect dict into a BlockRequisition."""
+    from .pipeline import normalize_legacy_defect
+
+    return normalize_legacy_defect(defect, source="TDMS")
+
+
 if __name__ == "__main__":
     data = generate_tdms_defects(10)
     print(f"Generated {len(data)} sample TDMS defects.")
     print("Sample record:", data[0])
+
+    requisition = normalize_tdms_defect(data[0])
+    print(
+        f"Normalised      : {requisition.asset_id} [{requisition.dept.value}] "
+        f"km {requisition.km_start}-{requisition.km_end} on {requisition.line.value}"
+    )
+    print(f"Feeding post    : {requisition.feeding_post or requisition.geo_start.station_code}")
