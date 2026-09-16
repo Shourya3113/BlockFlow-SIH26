@@ -18,6 +18,17 @@ SECTIONS = [
 
 TRACKS = ["UP_FAST", "DN_FAST", "UP_SLOW", "DN_SLOW"]
 
+#: Coded fault classification TMS attaches to each work type (engineering
+#: attribute; says nothing about which statutory memo may be needed later).
+FAULT_CODES = {
+    "USFD_IMR_WELD": "USFD_IMR",
+    "USFD_OBS_FLAW": "USFD_OBS",
+    "TRACK_TAMPING": "GEOM_SD_HIGH",
+    "TURNOUT_RENEWAL": "TURNOUT_CMS",
+    "RAIL_DESTRESSING": "LWR_SEJ",
+    "DEEP_SCREENING_BCM": "BALLAST_CUSHION",
+}
+
 ENGINEERING_TASKS = [
     {
         "type": "USFD_IMR_WELD",
@@ -99,6 +110,13 @@ def generate_tms_defects(count: int = 25, seed: int = 42) -> List[Dict[str, Any]
             "track_id": trk,
             "km_start": km_start,
             "km_end": km_end,
+            # Canonical engineering attributes. The legacy spellings emitted
+            # alongside them (defect_type / duration_mins / psr_speed_kmph) are
+            # the optimizer-and-ACI bridge and can be retired field by field.
+            "work_type": task_tmpl["type"],
+            "fault_code": FAULT_CODES[task_tmpl["type"]],
+            "requested_duration_mins": task_tmpl["base_duration_mins"],
+            "speed_restriction_psr": task_tmpl["psr_speed_kmph"],
             "defect_type": task_tmpl["type"],
             "description": task_tmpl["description"],
             "severity": task_tmpl["severity"],
@@ -147,11 +165,10 @@ if __name__ == "__main__":
     print("Sample record:", data[0])
 
     requisition = normalize_tms_defect(data[0])
+    print(f"LRS span        : {requisition.to_lrs_dict()}")
+    requisition.project_display()
     print(
-        f"Normalised      : {requisition.asset_id} [{requisition.dept.value}] "
-        f"km {requisition.km_start}-{requisition.km_end} on {requisition.line.value}"
-    )
-    print(
-        f"Snapped to      : {requisition.geo_start.lon}, {requisition.geo_start.lat} "
-        f"({requisition.geo_start.nearest_waypoint_id}, section {requisition.section})"
+        f"Display only    : {requisition.display_start.coordinates} "
+        f"({requisition.display_start.nearest_waypoint_id}, section {requisition.section})"
+        "  [read-only projection, never a solver input]"
     )

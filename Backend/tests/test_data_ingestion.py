@@ -1,16 +1,21 @@
 """
 test_data_ingestion.py - Verification suite for the BlockFlow ingestion layer
 
-Covers the four things the jury is expected to attack:
+Covers the five things the jury is expected to attack:
 
-1.  **439-point waypoint database** - count, chainage closure on 59.980 km,
-    29 stations, monotonic WGS84 snapping, per-running-line lateral offsets.
-2.  **The frozen Pydantic v2 contract** - ``[asset_id, dept, km_start, km_end,
-    aci]``, silo alias normalisation, and hard rejection of out-of-corridor /
-    inverted / malformed chainage.
-3.  **Statutory invariants** - ACTM Vol II Para 204 ``+15 / +15`` earthing buffer
-    arithmetic and IRSEM Para 22 Form T/351 / T/352 generation.
-4.  **Phase-4 stress behaviour** - the 50-requisition reference feed ingests
+1.  **1D Linear Referencing System** - the ``has_overlap`` interval algebra that
+    is the whole of the spatial solver constraint, including the half-open
+    adjacency rule and the corridor/running-line scoping.
+2.  **439-point projection table** - count, chainage closure on 59.980 km, 29
+    stations, monotonic projection, per-running-line lateral offsets, and the
+    ``[lat, lon]`` read-only display payload.
+3.  **The frozen Pydantic v2 contract** - ``[asset_id, dept, km_start, km_end,
+    aci]`` on an LRS span, silo alias normalisation, and hard rejection of
+    out-of-corridor / inverted / malformed chainage.
+4.  **Statutory invariants** - ACTM Vol II Para 204 ``+15 / +15`` earthing buffer
+    arithmetic, IRSEM Para 22 Form T/351 / T/352 generation, and 1D chainage
+    exclusivity of the scheduled plan.
+5.  **Phase-4 stress behaviour** - the 50-requisition reference feed ingests
     cleanly (or is quarantined with a reason), and the malformed corpus never
     leaks a bad row into the HiGHS simplex solver.
 
@@ -31,11 +36,25 @@ if ROOT not in sys.path:
 from Backend.data_ingestion import (  # noqa: E402
     ACTM_PARA_204_EARTHING_BUFFER_MINS,
     CONTRACT_FIELDS,
+    LRS_FIELDS,
+    Authority,
     BlockRequisition,
+    DigitalGrantPermit,
+    FormCode,
+    LinearSpan,
+    PermitStatus,
+    build_permits_for_block,
     coa_data,
+    derive_permit_requirements,
+    gap_km,
+    has_overlap,
     ingest_corridor,
     ingest_feed,
     load_malformed_cases,
+    lrs,
+    merge_spans,
+    overlap_length_km,
+    permits,
     safety,
     schema,
     spatial,
@@ -56,7 +75,148 @@ def _in_bbox(lon, lat) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-#  1. Waypoint database + chainage snapping
+#  0. The 1D Linear Referencing System (LRS)
+# --------------------------------------------------------------------------- #
+def _span(km_start, km_end, line_id="DN_FAST", corridor_id=None):
+    return LinearSpan(
+        corridor_id=corridor_id or lrs.CORRIDOR_ID,
+        line_id=line_id,
+        km_start=km_start,
+        km_end=km_end,
+    )
+
+
+def test_lrs_interval_algebra():
+    """The entire spatial solver constraint, expressed in one dimension."""
+    a = _span(19.0, 21.0)
+
+    # ---- overlap forms ---------------------------------------------------- #
+    assert has_overlap(a, _span(20.0, 22.0)), "partial overlap"
+    assert has_overlap(a, _span(19.5, 20.5)), "containment"
+    assert has_overlap(a, _span(18.0, 25.0)), "superset"
+    assert has_overlap(a, _span(19.0, 21.0)), "identical"
+    assert overlap_length_km(a, _span(20.0, 23.0)) == 1.0
+
+    # ---- half-open: touching end-to-end is not a collision ----------------- #
+    assert not has_overlap(a, _span(21.0, 23.0))
+    assert not has_overlap(_span(17.0, 19.0), a)
+    assert gap_km(a, _span(21.0, 23.0)) == 0.0, "but they are exactly adjacent"
+
+    # ---- disjoint -------------------------------------------------------- #
+    assert not has_overlap(a, _span(30.0, 31.0))
+    assert gap_km(a, _span(30.0, 31.0)) == 9.0
+    assert overlap_length_km(a, _span(30.0, 31.0)) == 0.0
+
+    # ---- scoping: a different running line is a different space ----------- #
+    assert not has_overlap(a, _span(20.0, 22.0, line_id="UP_SLOW"))
+    assert gap_km(a, _span(20.0, 22.0, line_id="UP_SLOW")) == float("inf")
+
+    # ---- scoping: so is a different corridor ----------------------------- #
+    assert not has_overlap(a, _span(20.0, 22.0, corridor_id="WR-OTHER-CORRIDOR"))
+
+    # ---- the relation is intransitive, so O(n^2) is the honest scan -------- #
+    collisions = lrs.find_collisions([_span(0.0, 2.0), _span(1.0, 3.0), _span(2.5, 4.0)])
+    assert [(i, j) for i, j, _ in collisions] == [(0, 1), (1, 2)]
+    assert not has_overlap(_span(0.0, 2.0), _span(2.5, 4.0))
+
+    # ---- coalescing into minimal linear extents --------------------------- #
+    merged = merge_spans([
+        _span(1.0, 2.0), _span(1.8, 2.4), _span(2.4, 3.0),  # -> one extent
+        _span(10.0, 11.0),                                  # -> separate
+        _span(5.0, 6.0, line_id="UP_FAST"),                 # -> other line
+    ])
+    assert (lrs.CORRIDOR_ID, "DN_FAST", 1.0, 3.0) in merged
+    assert (lrs.CORRIDOR_ID, "DN_FAST", 10.0, 11.0) in merged
+    assert (lrs.CORRIDOR_ID, "UP_FAST", 5.0, 6.0) in merged
+    assert len(merged) == 3
+
+    # ---- unresolvable lines are conservative, never silently disjoint ----- #
+    unknown = has_overlap(
+        {"km_start": 1.0, "km_end": 2.0}, {"km_start": 1.5, "km_end": 2.5}
+    )
+    assert unknown, "two records with no line id must still be treated as colliding"
+
+    # ---- legacy optimizer rows work too (track_id spelling) --------------- #
+    assert has_overlap(
+        {"track_id": "DN_FAST", "km_start": 1.0, "km_end": 2.0},
+        {"track_id": "DN_FAST", "km_start": 1.5, "km_end": 2.5},
+    )
+    assert not has_overlap(
+        {"track_id": "DN_FAST", "km_start": 1.0, "km_end": 2.0},
+        {"track_id": "DN_SLOW", "km_start": 1.5, "km_end": 2.5},
+    )
+
+
+def test_lrs_replaces_section_proximity():
+    """
+    A section code is a reporting bookmark, not a geometry.
+
+    Before the LRS refactor, conflict detection was keyed on
+    ``(section, track_id)``, so two jobs in the same 7 km section were treated as
+    colliding no matter how far apart they were. In 1D they simply are not -
+    and two jobs genuinely on top of each other still are.
+    """
+    def requisition(asset_id, km_start, km_end):
+        return BlockRequisition(
+            asset_id=asset_id, dept="CIVIL", line_id="DN_FAST",
+            km_start=km_start, km_end=km_end, duration_mins=60,
+        )
+
+    near = requisition("TMS-ENG-0001", 19.40, 19.60)
+    far = requisition("TMS-ENG-0002", 21.00, 21.20)
+    on_top = requisition("TMS-ENG-0003", 19.50, 19.90)
+
+    # Same section, 1.4 km of clear track between them.
+    assert near.section == far.section == "BA-AND"
+    assert not has_overlap(near, far)
+    assert gap_km(near, far) == 1.4
+
+    # Same section, genuinely overlapping chainage.
+    assert has_overlap(near, on_top)
+    assert overlap_length_km(near, on_top) == 0.1
+
+    # Different running lines at the same chainage never collide.
+    opposite = BlockRequisition(
+        asset_id="TMS-ENG-0004", dept="CIVIL", line_id="UP_SLOW",
+        km_start=19.40, km_end=19.60, duration_mins=60,
+    )
+    assert not has_overlap(near, opposite)
+
+
+def test_lrs_span_contract():
+    """``LinearSpan`` is the primary spatial key, and it is validated hard."""
+    span = _span(19.4, 21.2)
+    assert span.corridor_id == "WR-MUMBAI-CCG-VR"
+    assert span.line_id == "DN_FAST"
+    assert span.span_km == 1.8
+    assert span.lrs_key == ("WR-MUMBAI-CCG-VR", "DN_FAST")
+    assert span.interval == (19.4, 21.2)
+    assert set(LRS_FIELDS) <= set(span.to_lrs_dict())
+
+    # Corridor/line spellings fold onto the canonical ids.
+    folded = LinearSpan(corridor="Churchgate - Virar", track="DN FAST",
+                        km_from="20400 M", km_to=21.2)
+    assert folded.corridor_id == lrs.CORRIDOR_ID
+    assert folded.line_id == "DN_FAST"
+    assert folded.km_start == 20.4, "bare metre figures are a real CRIS quirk"
+
+    # The 1D invariants still reject unsafe geometry.
+    for patch, label in (
+        ({"km_start": 25.0, "km_end": 18.0}, "inverted chainage"),
+        ({"km_end": 62.4}, "outside the corridor"),
+        ({"km_start": -2.5}, "negative chainage"),
+        ({"line_id": "DN_UP"}, "unknown running line"),
+    ):
+        base = {"line_id": "DN_FAST", "km_start": 10.0, "km_end": 11.0} | patch
+        try:
+            LinearSpan(**base)
+        except Exception:
+            continue
+        raise AssertionError(f"LinearSpan accepted {label}")
+
+
+# --------------------------------------------------------------------------- #
+#  1. Waypoint projection table
 # --------------------------------------------------------------------------- #
 def test_waypoint_database():
     assert len(waypoints.WAYPOINTS) == 439, "the surveyed database is 439 waypoints"
@@ -115,6 +275,18 @@ def test_chainage_snapping_and_offsets():
     assert len(geojson["features"]) == 439
     assert geojson["properties"]["waypoint_count"] == 439
 
+    # The projection table exists only to emit `[lat, lon]` display payloads.
+    projected = waypoints.project_km(21.35, "DN_FAST")
+    assert projected["coordinates"] == [projected["lat"], projected["lon"]]
+    assert projected["projection_only"] is True
+    assert projected["corridor_id"] == lrs.CORRIDOR_ID
+    assert projected["line_id"] == "DN_FAST"
+    assert _in_bbox(projected["lon"], projected["lat"])
+    assert projected["coordinates"] == waypoints.project_km(21.35, "DN_FAST")["coordinates"]
+    # A centreline projection (no line given) sits between the two outer lines.
+    centreline = waypoints.project_km(21.35)["coordinates"]
+    assert fast["lateral_offset_m"] == 6.0 and centreline != projected["coordinates"]
+
 
 # --------------------------------------------------------------------------- #
 #  2. Frozen contract
@@ -134,7 +306,6 @@ def test_contract_fields_and_aliases():
     )
     assert requisition.asset_id == "TMS-ENG-1006"
     assert requisition.dept is schema.Department.CIVIL
-    assert requisition.line is schema.Line.DN_FAST
     assert requisition.urgency is schema.Severity.CRITICAL
     assert requisition.duration_mins == 180
     assert requisition.requires_power_block is True
@@ -143,15 +314,38 @@ def test_contract_fields_and_aliases():
     assert requisition.span_km == 1.8
     assert requisition.aci is None, "aci stays null until the ACI engine scores it"
 
+    # ---- the LRS primary key --------------------------------------------- #
+    assert requisition.corridor_id == lrs.CORRIDOR_ID
+    assert requisition.line_id == "DN_FAST", "line_id is the canonical LRS field"
+    assert requisition.line is schema.Line.DN_FAST, "Line enum stays as a convenience"
+    assert requisition.lrs_key == (lrs.CORRIDOR_ID, "DN_FAST")
+    assert isinstance(requisition, LinearSpan)
+
     contract = requisition.to_contract_dict()
     for field in CONTRACT_FIELDS:
         assert field in contract
+    for field in LRS_FIELDS:
+        assert field in contract, f"contract lost the LRS field {field}"
 
-    requisition.with_spatial_fix()
-    assert requisition.geo_start is not None and requisition.geo_end is not None
-    assert _in_bbox(requisition.geo_start.lon, requisition.geo_start.lat)
-    assert requisition.geo_start.nearest_waypoint_id.startswith("WP-")
-    assert requisition.to_legacy_dict()["track_id"] == "DN_FAST"
+    legacy = requisition.to_legacy_dict()
+    assert legacy["track_id"] == "DN_FAST" and legacy["line_id"] == "DN_FAST"
+    assert legacy["corridor_id"] == lrs.CORRIDOR_ID
+
+    # ---- the projection is display-only, and explicitly ordered ---------- #
+    assert requisition.display_start is None
+    requisition.project_display()
+    start, end = requisition.display_start, requisition.display_end
+    assert start is not None and end is not None
+    assert _in_bbox(start.lon, start.lat)
+    assert start.nearest_waypoint_id.startswith("WP-")
+    assert start.coordinates == [start.lat, start.lon], "display order is [lat, lon]"
+    assert start.geojson_coordinates == [start.lon, start.lat], "GeoJSON is [lon, lat]"
+    assert start.read_only is True
+    assert requisition.geo_start is start, "geo_start is a read-only alias"
+    assert requisition.to_display_payload()["projection_only"] is True
+
+    # The projection must never leak into the solver payload.
+    assert "display_start" not in legacy and "lat" not in legacy
 
 
 def test_contract_rejects_unsafe_chainage():
@@ -225,59 +419,280 @@ def test_actm_para_204_earthing_buffer():
     assert verdict["earthing_window"]["total_possession_mins"] == 90
 
 
-def test_irsem_form_t351_disconnection():
+def test_statutory_memos_are_outputs_not_inputs():
+    """
+    Form T/351 / T/352 are *generated after scheduling*, never demanded on the way in.
+
+    A requisition arriving weeks ahead of the planning horizon cannot cite a memo
+    that a Sectional Controller has not issued yet, so the old ``statutory_form``
+    gate rejected conforming data. What is still enforced is the engineering
+    completeness Form T/351 needs: a disconnection job must name its gear.
+    """
+    # The contract no longer has an input field for it at all.
+    assert "statutory_form" not in BlockRequisition.model_fields
+    assert "referenced_form" in BlockRequisition.model_fields
+
+    base = {
+        "asset_id": "SMMS-SNT-2011", "dept": "SNT", "line_id": "DN_SLOW",
+        "km_start": 33.95, "km_end": 34.15, "requested_duration_mins": 60,
+        "work_type": "POINT_MACHINE_TEST", "gear_id": "PT-DDR-11",
+        "requires_disconnection": True, "requires_traffic_block": True,
+    }
+
+    # (a) citing no form at all is fine - the memo does not exist yet.
+    bare = safety.evaluate_safety_invariants(base)
+    assert bare["passed"], bare["violations"]
+    assert set(bare["statutory_forms_required"]) >= {"T_351", "T_352"}
+    assert bare["referenced_form"] is None
+
+    # (b) citing one is fine too; it is recorded as provenance and nothing more.
+    cited = safety.evaluate_safety_invariants({**base, "statutory_form": "T/351"})
+    assert cited["passed"], cited["violations"]
+    assert cited["referenced_form"] == "T_351"
+    assert cited["statutory_forms_required"] == bare["statutory_forms_required"], (
+        "a cited form must not change what is generated"
+    )
+
+    # (c) even a nonsense citation is not a rejection - it simply is not recorded.
+    junk = safety.evaluate_safety_invariants({**base, "statutory_form": "FORM 99/ZZ"})
+    assert junk["passed"], junk["violations"]
+    assert junk["referenced_form"] is None
+
+    # (d) the one thing still enforced: a disconnection must name its gear, or
+    #     Form T/351 cannot be prefilled downstream.
+    unnamed = safety.evaluate_safety_invariants({
+        **base, "gear_id": None, "point_no": None,
+    })
+    assert not unnamed["passed"]
+    assert "DISCONNECTION_GEAR_IDENTIFIED" in unnamed["violations"]
+
+    # (e) the requirement is derived, and the derivation is auditable.
+    requirements = derive_permit_requirements(base)
+    assert requirements.forms == ["T_351", "T_352"]
+    assert any("disconnection" in reason for reason in requirements.reasons)
+
+    # (f) an S&T job that touches no field gear raises no Form T/351 - the
+    #     pre-refactor code forced one onto every SMMS row off the department
+    #     alone, manufacturing paperwork for diagnostics.
+    diagnostic = derive_permit_requirements({
+        "dept": "SNT", "line_id": "DN_SLOW", "km_start": 10.0, "km_end": 10.2,
+        "work_type": "ELECTRONIC_INTERLOCKING_DIAG", "requires_disconnection": False,
+    })
+    assert diagnostic.forms == []
+
+
+def test_permit_bundle_is_prefilled_from_the_memo_side():
+    """The instruments a requisition attracts, and the window arithmetic they carry."""
     snT = {
-        "asset_id": "SMMS-SNT-2011", "dept": "SNT", "line": "DN_SLOW",
-        "km_start": 33.95, "km_end": 34.15, "duration_mins": 60,
-        "requires_disconnection": True, "statutory_form": "T/351",
-        "requires_traffic_block": True,
+        "asset_id": "SMMS-SNT-2011", "dept": "SNT", "line_id": "DN_SLOW",
+        "km_start": 33.95, "km_end": 34.15, "requested_duration_mins": 60,
+        "work_type": "POINT_MACHINE_TEST", "gear_id": "PT-DDR-11",
+        "requires_disconnection": True, "requires_traffic_block": True,
+        "work_start": "01:30",
     }
     verdict = safety.evaluate_safety_invariants(snT)
     assert verdict["passed"], verdict["violations"]
-    assert set(verdict["statutory_forms_required"]) >= {"T_351", "T_352"}
 
     forms = {memo["form_no"]: memo for memo in verdict["memos"]}
     assert "IRSEM Para 22" in forms["T_351"]["statutory_reference"]
     assert forms["T_351"]["km_range"] == "33.95 - 34.15"
     assert forms["T_352"]["valid_from"] == verdict["earthing_window"]["power_restored_at"]
 
-    # A disconnection job with no Form T/351 must be blocked, not waved through.
-    missing = {**snT, "statutory_form": "NONE"}
-    blocked = safety.evaluate_safety_invariants(missing)
-    assert not blocked["passed"]
-    assert "IRSEM_22_T351_DISCONNECTION" in blocked["violations"]
+    # The paired notices cross-reference each other.
+    assert forms["T_351"]["reconnection_form_no"] == forms["T_352"]["memo_no"]
+    assert forms["T_352"]["disconnection_form_no"] == forms["T_351"]["memo_no"]
+    # ...and the gear is named, because the requirement is derived from the work.
+    assert [gear["gear_id"] for gear in forms["T_351"]["affected_gears"]] == ["PT-DDR-11"]
 
-    # A civil tamping job is not an IRSEM disconnection job.
+    # A civil tamping job is not an IRSEM disconnection job, but it does pull in
+    # an ACTM Permit-to-Work for its 25 kV isolation and a Para 284 caution order.
     civil = safety.evaluate_safety_invariants({
-        "asset_id": "TMS-ENG-1006", "dept": "CIVIL", "line": "DN_FAST",
-        "km_start": 19.4, "km_end": 21.2, "duration_mins": 180,
-        "requires_power_block": True, "requires_traffic_block": True,
+        "asset_id": "TMS-ENG-1006", "dept": "CIVIL", "line_id": "DN_FAST",
+        "km_start": 19.4, "km_end": 21.2, "requested_duration_mins": 180,
+        "work_type": "TRACK_TAMPING", "requires_power_block": True,
+        "requires_traffic_block": True, "work_start": "01:30",
     })
-    assert civil["passed"]
+    assert civil["passed"], civil["violations"]
     assert "T_351" not in civil["statutory_forms_required"]
-    assert "ACTM_PTW" in civil["statutory_forms_required"]
+    assert set(civil["statutory_forms_required"]) == {"ACTM_PTW", "IRPWM_284_CAUTION"}
+
+
+def test_digital_grant_permit_prefill():
+    """A scheduled block prefills its whole statutory bundle, unsigned."""
+    block = {
+        "block_id": "IR-BLK-2026001", "date": "2026-09-20", "start_time": "01:30",
+        "corridor_id": lrs.CORRIDOR_ID, "line_id": "DN_FAST",
+        "km_start": 19.0, "km_end": 21.0, "span_km": 2.0,
+        "section": "DDR-BA", "section_name": "Dadar - Bandra", "track_id": "DN_FAST",
+        "allocated_duration_mins": 180, "slot_window_mins": 240,
+        "requires_power_block": True, "requires_traffic_block": True,
+        "tasks_bundled": [
+            {"asset_id": "TMS-ENG-1006", "department": "CIVIL",
+             "work_type": "TRACK_TAMPING", "requested_duration_mins": 180,
+             "km_start": 19.0, "km_end": 21.0, "requires_power_block": True,
+             "requires_traffic_block": True, "speed_restriction_psr": 30},
+            {"asset_id": "SMMS-SNT-2011", "department": "SNT",
+             "work_type": "POINT_MACHINE_TEST", "gear_id": "PT-DDR-11",
+             "requested_duration_mins": 60, "km_start": 19.4, "km_end": 19.6,
+             "requires_disconnection": True},
+        ],
+    }
+    permit = build_permits_for_block(block)
+    assert isinstance(permit, DigitalGrantPermit)
+    assert permit.permit_id == "IR-DGP-IR-BLK-2026001"
+    assert permit.status is PermitStatus.PREFILLED
+
+    # ---- the assigned window + the ACTM Para 204 wrap --------------------- #
+    assert permit.earthing.required is True
+    assert permit.earthing.buffer_mins == ACTM_PARA_204_EARTHING_BUFFER_MINS
+    assert permit.possession_mins == 180 + 2 * 15 == permit.earthing.total_possession_mins
+    assert permit.earthing.arithmetic.startswith("180 + 15 + 15 = 210 min")
+    # The granted window is the full blocked period: power off -> power restored.
+    assert permit.window_start == permit.earthing.power_off_at
+    assert permit.window_end == permit.earthing.power_restored_at
+    assert (permit.window_end - permit.window_start).total_seconds() == 210 * 60
+    assert permit.work_start == permit.earthing.work_start
+
+    # ---- 1D identity, so a permit maps back onto the LRS plan ------------ #
+    assert permit.corridor_id == lrs.CORRIDOR_ID and permit.line_id == "DN_FAST"
+    assert permit.lrs_key == [lrs.CORRIDOR_ID, "DN_FAST"]
+    assert has_overlap(permit, permit), "a permit is itself an LRS span"
+    assert permit.span_km == 2.0
+
+    # ---- instruments, derived from the bundled work ---------------------- #
+    assert permit.requires_disconnection is True
+    assert permit.memo_index["T_351"].endswith("/T351")
+    assert set(permit.memo_index) == {"T_351", "T_352", "ACTM_PTW", "IRPWM_284_CAUTION"}
+    assert permit.form_t352.window_start == permit.earthing.power_restored_at
+    assert permit.form_t352.window_end is None, "a reconnection does not expire"
+    assert permit.actm_permit_to_work.earthing.total_possession_mins == 210
+    assert permit.caution_order.speed_restriction_psr == 30
+    assert permit.affected_signalling_gears[0].gear_id == "PT-DDR-11"
+    assert permit.affected_signalling_gears[0].gear_type is permits.GearType.POINT_MACHINE
+
+    # ---- nobody has signed: the optimizer proposes, a human disposes ----- #
+    assert set(permit.unsigned_authorities) == {
+        "SECTION_CONTROLLER", "TRACTION_POWER_CONTROLLER",
+        "STATION_MASTER", "SECTION_ENGINEER",
+    }
+    assert all(s.signed_by is None and s.signed_at is None for s in permit.authorizations)
+    assert permit.actm_permit_to_work.tpc_authorization.status is permits.SignatureStatus.PENDING
+
+    signed = permit.issue(Authority.TRACTION_POWER_CONTROLLER, "TPC Mumbai", employee_id="1234")
+    assert Authority.TRACTION_POWER_CONTROLLER.value not in signed.unsigned_authorities
+    assert signed.status is PermitStatus.PREFILLED, "one signature is not the whole permit"
+    for authority in list(signed.unsigned_authorities):
+        signed = signed.issue(Authority(authority), f"Signed by {authority}")
+    assert signed.status is PermitStatus.ISSUED and not signed.unsigned_authorities
+
+    # JSON round-trip: the permit is the artefact handed to the control desk.
+    json.dumps(permit.model_dump(mode="json"))
+
+
+def test_permit_models_refuse_to_fabricate_or_miscarry():
+    """The output models encode the statutory arithmetic and signature integrity."""
+    # A signature cannot be asserted without a name and a timestamp.
+    for bad in (
+        {"authority": "SECTION_CONTROLLER", "designation": "SC", "status": "SIGNED"},
+        {"authority": "SECTION_CONTROLLER", "designation": "SC", "status": "SIGNED",
+         "signed_by": "X"},
+    ):
+        try:
+            permits.AuthorizationSignature(**bad)
+        except Exception:
+            continue
+        raise AssertionError(f"a fabricated signature was accepted: {bad}")
+
+    # ACTM Para 204 arithmetic is proven, not merely computed.
+    good = permits.build_earthing_buffer("01:30", 90, power_isolation_required=True)
+    assert good.total_possession_mins == 120 and good.buffer_mins == 15
+    try:
+        permits.EarthingBuffer(
+            required=True, buffer_mins=5, work_duration_mins=90, total_possession_mins=100,
+            power_off_at=good.power_off_at, work_start=good.work_start,
+            work_end=good.work_end, power_restored_at=good.power_restored_at,
+            statutory_reference="x",
+        )
+    except Exception:
+        pass
+    else:
+        raise AssertionError("ACTM Para 204 accepted a non-15-minute earthing buffer")
+
+    # No live OHE exposure -> no buffer, and the possession is the work itself.
+    dry = permits.build_earthing_buffer("01:30", 90, power_isolation_required=False)
+    assert dry.buffer_mins == 0 and dry.total_possession_mins == 90
+    assert dry.arithmetic.endswith("ACTM Para 204 not applicable)")
+
+    # Gear classification follows the equipment, then the work type.
+    assert permits.classify_gear("PT-DDR-11") is permits.GearType.POINT_MACHINE
+    assert permits.classify_gear("MSDAC-04") is permits.GearType.AXLE_COUNTER
+    assert permits.classify_gear(None, "SIGNAL_ASPECT_REPLACEMENT") is permits.GearType.SIGNAL
+    assert permits.classify_gear("XYZ") is permits.GearType.UNKNOWN
 
 
 def test_plan_guardrail_detects_conflicts():
-    plan = [
-        {
-            "block_id": "IR-BLK-TEST-1", "date": "2026-09-20", "start_time": "01:30",
-            "section": "DDR-BA", "track_id": "DN_FAST", "allocated_duration_mins": 180,
-            "slot_window_mins": 195,
-            "tasks_bundled": [{"asset_id": "TMS-ENG-1006", "duration_mins": 180, "requires_power_block": True}],
-        },
-        {
-            "block_id": "IR-BLK-TEST-2", "date": "2026-09-20", "start_time": "02:00",
-            "section": "DDR-BA", "track_id": "DN_FAST", "allocated_duration_mins": 120,
-            "slot_window_mins": 120,
-            "tasks_bundled": [{"asset_id": "SMMS-SNT-2001", "duration_mins": 120, "requires_power_block": True}],
-        },
-    ]
-    result = safety.validate_plan(plan)
-    assert not result["passed"]
-    codes = {violation.split(":")[0] for violation in result["violations"]}
-    assert "PHYSICAL_EXCLUSIVITY" in codes
-    assert "POWER_ISOLATION_ENVELOPE" in codes or "DURATION_CAPACITY" in codes
+    """The plan guardrail is a 1D chainage-collision test, not a section test."""
+    def block(block_id, start_time, km_start, km_end, line_id="DN_FAST", **extra):
+        return {
+            "block_id": block_id, "date": "2026-09-20", "start_time": start_time,
+            "corridor_id": lrs.CORRIDOR_ID, "line_id": line_id,
+            "km_start": km_start, "km_end": km_end, "span_km": round(km_end - km_start, 3),
+            "section": "DDR-BA", "track_id": line_id,
+            "allocated_duration_mins": 180, "slot_window_mins": 240,
+            "tasks_bundled": [{
+                "asset_id": block_id, "duration_mins": 180,
+                "requires_power_block": True,
+            }],
+            **extra,
+        }
+
+    # Colliding kilometre intervals in an overlapping time window -> violation.
+    colliding = safety.validate_plan([
+        block("IR-BLK-T1", "01:30", 19.0, 21.0),
+        block("IR-BLK-T2", "02:00", 20.0, 22.0),
+    ])
+    assert not colliding["passed"]
+    codes = {violation.split(":")[0] for violation in colliding["violations"]}
+    assert "CHAINAGE_INTERVAL_EXCLUSIVITY" in codes
+    exclusive = [c for c in colliding["checks"] if c["code"] == "CHAINAGE_INTERVAL_EXCLUSIVITY"]
+    assert exclusive and exclusive[0]["status"] == "FAIL"
+    assert "1.000 km" in exclusive[0]["detail"]
+
+    # Same section and same line, but 4 km of clear track apart -> no conflict,
+    # even in an overlapping time window. The pre-LRS section-keyed check
+    # wrongly forbade this.
+    separated = safety.validate_plan([
+        block("IR-BLK-T3", "01:30", 19.0, 20.0),
+        block("IR-BLK-T4", "02:00", 24.0, 25.0),
+    ])
+    assert separated["passed"], separated["violations"]
+    assert not any(v.startswith("CHAINAGE_INTERVAL_EXCLUSIVITY") for v in separated["violations"])
+
+    # Overlapping chainage on a different running line -> no conflict either:
+    # the quad corridor has four independent spaces.
+    other_line = safety.validate_plan([
+        block("IR-BLK-T5", "01:30", 19.0, 21.0),
+        block("IR-BLK-T6", "02:00", 19.0, 21.0, line_id="UP_SLOW"),
+    ])
+    assert other_line["passed"], other_line["violations"]
+
+    # A block carrying no chainage at all cannot be assessed in 1D and must be
+    # reported, not silently blessed.
+    unresolved = safety.validate_plan([
+        {"block_id": "IR-BLK-T7", "date": "2026-09-20", "start_time": "01:30",
+         "section": "DDR-BA", "track_id": "DN_FAST", "allocated_duration_mins": 60},
+        {"block_id": "IR-BLK-T8", "date": "2026-09-20", "start_time": "01:30",
+         "section": "DDR-BA", "track_id": "DN_FAST", "allocated_duration_mins": 60},
+    ])
+    assert not unresolved["passed"]
+    assert any(v.startswith("LRS_EXTENT_RESOLVED") for v in unresolved["violations"])
+
+    # The duration/envelope arithmetic still behaves as before.
+    under_budget = safety.validate_plan([block(
+        "IR-BLK-T9", "01:30", 19.0, 21.0, allocated_duration_mins=60, slot_window_mins=60,
+    )])
+    codes = {violation.split(":")[0] for violation in under_budget["violations"]}
+    assert "DURATION_CAPACITY" in codes or "POWER_ISOLATION_ENVELOPE" in codes
 
 
 # --------------------------------------------------------------------------- #
@@ -332,8 +747,10 @@ def test_malformed_corpus_never_leaks():
         assert waypoints.validate_chainage(requisition.km_end)
         assert requisition.km_start <= requisition.km_end
         assert requisition.span_km <= 19.98
-        assert requisition.geo_start is not None and requisition.geo_end is not None
-        assert _in_bbox(requisition.geo_start.lon, requisition.geo_start.lat)
+        assert requisition.display_start is not None and requisition.display_end is not None
+        assert _in_bbox(requisition.display_start.lon, requisition.display_start.lat)
+        assert requisition.corridor_id == lrs.CORRIDOR_ID
+        assert requisition.line_id in lrs.LINE_IDS
         assert requisition.asset_id in verdicts, "every accepted record gets a safety verdict"
 
 
@@ -367,6 +784,8 @@ def test_geojson_output_for_gati_shakti():
     report = ingest_feed([load_raw_requisitions()[5]], source="TMS")
     geojson = report.geojson
     assert geojson["type"] == "FeatureCollection"
+    assert geojson["properties"]["corridor_id"] == lrs.CORRIDOR_ID
+    assert geojson["properties"]["projection_only"] is True
 
     linestrings = [f for f in geojson["features"] if f["geometry"]["type"] == "LineString"]
     points = [f for f in geojson["features"] if f["geometry"]["type"] == "Point"]
@@ -374,20 +793,30 @@ def test_geojson_output_for_gati_shakti():
 
     feature = linestrings[0]
     props = feature["properties"]
+    # The authoritative identity is 1D and lives in the properties.
+    for field in LRS_FIELDS:
+        assert field in props, f"GeoJSON lost the LRS field {field}"
+    assert props["corridor_id"] == lrs.CORRIDOR_ID
+    assert props["line_id"] == "DN_FAST"
+    assert props["lrs_key"] == [lrs.CORRIDOR_ID, "DN_FAST"]
     assert props["asset_id"] == "TMS-ENG-1006"
     assert props["dept"] == "CIVIL" and props["line"] == "DN_FAST"
     assert props["actm_para_204_buffer_mins"] == 15
     assert props["total_possession_mins"] == 210
     assert props["start_waypoint_id"].startswith("WP-")
+    assert props["projection_only"] is True
+    assert all(p["properties"]["projection_only"] for p in points)
+    assert all(p["properties"]["line_id"] == "DN_FAST" for p in points)
 
     coords = feature["geometry"]["coordinates"]
     assert len(coords) >= 5
     for lon, lat in coords:
         assert _in_bbox(lon, lat), f"coordinate {lon},{lat} left the Mumbai bbox"
 
-    # The first emitted vertex must equal the snapped start fix (on its own line).
-    fix = report.accepted[0].geo_start
-    assert abs(coords[0][0] - fix.lon) < 1e-5 and abs(coords[0][1] - fix.lat) < 1e-5
+    # The first emitted vertex must equal the projected start point (own line).
+    projection = report.accepted[0].display_start
+    assert abs(coords[0][0] - projection.lon) < 1e-5
+    assert abs(coords[0][1] - projection.lat) < 1e-5
 
     # JSON round-trip: the artefact handed to PM Gati Shakti must be serialisable.
     json.dumps(geojson)
@@ -444,6 +873,9 @@ def test_chainage_snap_is_deterministic():
 
 def test_highs_solver_handoff():
     """Feed the safety-cleared requisitions straight into the HiGHS MILP engine."""
+    # NOTE: the optimizer now reasons purely in 1D - it clusters demands by
+    # chainage proximity and forbids colliding kilometre intervals from sharing
+    # a slot - so the guardrail below is the same interval test it solved with.
     try:
         from Backend.ai_engine.block_optimizer import IntegratedBlockOptimizer
     except ImportError as exc:  # scipy not installed in a bare environment
@@ -465,6 +897,59 @@ def test_highs_solver_handoff():
     assert "scheduled_blocks" in result and "metrics" in result
     assert result["metrics"]["total_demands"] == len(rows)
     assert result["metrics"]["tasks_scheduled"] >= 1
+
+    # Every scheduled block states its possession in 1D and carries the
+    # statutory bundle generated *because* the window now exists.
+    for block in result["scheduled_blocks"]:
+        for field in LRS_FIELDS:
+            assert field in block, f"scheduled block lost the LRS field {field}"
+        assert block["line_id"] in lrs.LINE_IDS
+        assert block["km_start"] <= block["km_end"]
+        assert block["span_km"] == round(block["km_end"] - block["km_start"], 3)
+
+        assert "grant_permit" in block, "a scheduled block must prefill its paperwork"
+        assert block["permit_id"] == f"IR-DGP-{block['block_id']}"
+        grant = block["grant_permit"]
+        assert grant["status"] == PermitStatus.PREFILLED.value
+        assert grant["permit_id"] == block["permit_id"]
+        assert grant["lrs_key"] == [block["corridor_id"], block["line_id"]]
+        # The granted window is the earthing-inclusive possession.
+        assert grant["possession_mins"] == (
+            grant["earthing"]["work_duration_mins"]
+            + 2 * grant["earthing"]["buffer_mins"]
+        )
+        # A Digital Grant Permit always exists and always needs the Sectional
+        # Controller to release it; the specific statutory instruments are
+        # additional, and are legitimately empty when no disconnection, traction
+        # isolation or caution order applies. Raising paperwork nothing requires
+        # would be as wrong as demanding it on the way in.
+        assert "SECTION_CONTROLLER" in grant["unsigned_authorities"]
+        assert len(grant["statutory_references"]) == len(set(grant["statutory_references"])), (
+            "statutory references are deduplicated (T/351 and T/352 share IRSEM Para 22)"
+        )
+        if grant["memo_index"]:
+            assert grant["statutory_references"], "an attached instrument must cite its basis"
+        else:
+            assert grant["statutory_references"] == []
+        # Whatever was generated, the instruments are unsigned placeholders.
+        assert all(
+            signature["signed_by"] is None and signature["signed_at"] is None
+            for signature in grant["authorizations"]
+        )
+        assert block["statutory_forms"] == list(grant["memo_index"] or {}), (
+            "the block's form list and the permit's memo index must agree"
+        )
+
+    # The solver's own spatial statement was "no two colliding chainage intervals
+    # share a slot", so an independent 1D re-check must find nothing to object to.
+    for i in range(len(result["scheduled_blocks"])):
+        for j in range(i + 1, len(result["scheduled_blocks"])):
+            a, b = result["scheduled_blocks"][i], result["scheduled_blocks"][j]
+            if (a["date"], a["start_time"]) != (b["date"], b["start_time"]):
+                continue
+            assert not has_overlap(a, b), (
+                f"{a['block_id']} and {b['block_id']} share a slot with colliding chainage"
+            )
 
     # Independent guardrail. The current optimizer budgets only the working
     # duration, so planning against `duration_mins` short-changes the 15-minute
@@ -491,13 +976,19 @@ def test_highs_solver_handoff():
 
 def main():  # pragma: no cover - CLI report runner
     tests = [
-        ("Waypoint database: 439 WGS84 points / 29 stations / 59.98 km closure", test_waypoint_database),
-        ("Chainage snapping + quad-track lateral offsets", test_chainage_snapping_and_offsets),
-        ("Frozen contract + silo alias normalisation", test_contract_fields_and_aliases),
+        ("LRS: 1D interval algebra (has_overlap/gap/merge, corridor+line scoped)", test_lrs_interval_algebra),
+        ("LRS: section codes are bookmarks, chainage decides a conflict", test_lrs_replaces_section_proximity),
+        ("LRS: LinearSpan primary key + span invariants", test_lrs_span_contract),
+        ("Projection table: 439 points / 29 stations / 59.98 km closure", test_waypoint_database),
+        ("Chainage projection + quad-track lateral offsets", test_chainage_snapping_and_offsets),
+        ("Frozen contract + LRS identity + silo alias normalisation", test_contract_fields_and_aliases),
         ("Contract rejects out-of-corridor / malformed chainage", test_contract_rejects_unsafe_chainage),
         ("ACTM Para 204: 15-minute earthing buffer arithmetic", test_actm_para_204_earthing_buffer),
-        ("IRSEM Para 22: Form T/351 + T/352 generation", test_irsem_form_t351_disconnection),
-        ("Plan guardrail: exclusivity + power isolation envelope", test_plan_guardrail_detects_conflicts),
+        ("Statutory memos are outputs, not input gates", test_statutory_memos_are_outputs_not_inputs),
+        ("IRSEM Para 22 / ACTM instruments prefilled from the block", test_permit_bundle_is_prefilled_from_the_memo_side),
+        ("DigitalGrantPermit: window + earthing + gear prefill, unsigned", test_digital_grant_permit_prefill),
+        ("Permit models refuse fabricated signatures / bad Para 204 arithmetic", test_permit_models_refuse_to_fabricate_or_miscarry),
+        ("Plan guardrail: 1D chainage exclusivity + power isolation envelope", test_plan_guardrail_detects_conflicts),
         ("Ingestion layer: 50 CRIS requisitions validated", test_reference_feed_ingests_cleanly),
         ("Malformed payloads quarantined, never leaked", test_malformed_corpus_never_leaks),
         ("Malformed corpus outcomes match declared expectations", test_malformed_corpus_expectations),
@@ -528,6 +1019,7 @@ def main():  # pragma: no cover - CLI report runner
         f"| ACTM Para 204 buffer {summary and ACTM_PARA_204_EARTHING_BUFFER_MINS} min"
     )
     print(f"Optimizer-ready rows: {len(to_optimizer_payload(report))}")
+    print(f"LRS collisions   : {len(report.chainage_conflict_pairs())} candidate pair(s) to bundle")
     print("-" * 68)
     if failures:
         print(f"{failures} TEST(S) FAILED")

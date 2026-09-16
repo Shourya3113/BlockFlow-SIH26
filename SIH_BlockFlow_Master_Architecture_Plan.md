@@ -103,7 +103,8 @@ BlockFlow is designed with dual-use viability: a mission-critical sovereign publ
 
 ### Tool 1: Multi-Department Ingestion & Spatial Normalizer
 * **Function:** Ingests raw departmental block requisition feeds from TMS, SMMS, TDMS, and COA.
-* **Input Schema:** JSON payloads containing `asset_id`, `department` (CIVIL/TRD/SNT), `km_start`, `km_end`, `line` (UP_FAST/DN_FAST/UP_SLOW/DN_SLOW), `duration_mins`, `urgency`, and `statutory_form` (e.g., T/351).
+* **Input Schema:** JSON payloads containing `asset_id`, `department` (CIVIL/TRD/SNT), `km_start`, `km_end`, `line_id` (UP_FAST/DN_FAST/UP_SLOW/DN_SLOW), `work_type` / `fault_code`, `requested_duration_mins`, `speed_restriction_psr`, and `urgency`.
+* **Statutory memos are outputs, not inputs.** Form T/351 (disconnection), Form T/352 (reconnection) and the ACTM Permit-to-Work are *generated* by `Backend/data_ingestion/permits.py` once the optimizer has allocated a block window, then await Sectional Controller / TPC signature. A prospective requisition is never validated against a form number it cannot yet legally hold.
 * **Processing:** Validates fields against strict Pydantic v2 data contracts. Snaps railway kilometerage to exact WGS84 latitude/longitude coordinates using Western Railway's 439 surveyed waypoints.
 * **Output:** Normalized spatial requisition objects with verified isolation boundaries.
 

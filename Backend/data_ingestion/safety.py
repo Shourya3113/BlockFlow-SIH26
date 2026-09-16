@@ -21,6 +21,15 @@ Rules enforced here
     caution order.
 *   **Corridor boundary** - chainage must lie inside the surveyed 59.98 km
     Churchgate-Virar corridor.
+*   **LRS identity** - the running line must resolve to one of the four quad
+    lines, and the span must be a valid kilometre interval.
+
+Every spatial judgement here is 1D. A possession is a half-open chainage
+interval on a named running line, and two possessions conflict exactly when
+those intervals collide on the same line - see
+:func:`Backend.data_ingestion.lrs.has_overlap`. There is no polygon, no buffer
+radius and no geometric intersection anywhere in this module, so there is no
+float tolerance for a schedule to hide behind.
 
 Everything in this module is deterministic and dependency-free: the same
 requisition always yields the same verdict, which is what makes the
@@ -28,32 +37,27 @@ requisition always yields the same verdict, which is what makes the
 """
 
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
-from . import waypoints
+from . import lrs, permits, waypoints
 
-#: ACTM Vol II Para 204 - earthing / discharge buffer, minutes, each side.
-ACTM_PARA_204_EARTHING_BUFFER_MINS = 15
-
-#: ACTM Vol II Para 203 - traction power isolation reference.
-ACTM_PARA_203_REFERENCE = "ACTM Vol II Para 203 (Traction Power Controller isolation)"
-
-#: IRSEM Para 22 - disconnection / reconnection paperwork.
-IRSEM_PARA_22_REFERENCE = "IRSEM Para 22 (Form T/351 disconnection, T/352 reconnection)"
-IRSEM_DISCONNECTION_FORM = "T_351"
-IRSEM_RECONNECTION_FORM = "T_352"
-
-#: IRPWM Para 268(b) - speed restriction must be sanctioned and inside line speed.
-IRPWM_PARA_268B_REFERENCE = "IRPWM Para 268(b) (caution order and speed restriction)"
-
-#: IRPWM Para 284 - P-Way work under traffic protection.
-IRPWM_PARA_284_REFERENCE = "IRPWM Para 284 (P-Way work under traffic protection)"
+# The statutory constants and the earthing arithmetic live in ``permits`` - the
+# module that actually raises the paperwork. They are re-exported here because
+# the invariants, the API and the guardrail have always imported them from
+# safety, and duplicating the number 15 in two modules is exactly how a buffer
+# drifts.
+ACTM_PARA_204_EARTHING_BUFFER_MINS = permits.ACTM_PARA_204_EARTHING_BUFFER_MINS
+ACTM_PARA_203_REFERENCE = permits.ACTM_PARA_203_REFERENCE
+ACTM_PARA_204_REFERENCE = permits.ACTM_PARA_204_REFERENCE
+IRSEM_PARA_22_REFERENCE = permits.IRSEM_PARA_22_REFERENCE
+IRSEM_DISCONNECTION_FORM = permits.IRSEM_DISCONNECTION_FORM
+IRSEM_RECONNECTION_FORM = permits.IRSEM_RECONNECTION_FORM
+IRPWM_PARA_268B_REFERENCE = permits.IRPWM_PARA_268B_REFERENCE
+IRPWM_PARA_284_REFERENCE = permits.IRPWM_PARA_284_REFERENCE
+TRACK_PERMISSIBLE_SPEED_KMPH = permits.TRACK_PERMISSIBLE_SPEED_KMPH
 
 #: Absolute block / automatic block safe headway margin between trains (seconds).
 MIN_HEADWAY_SECONDS = 90
-
-#: Permissible speed of the Mumbai suburban quad section (km/h).
-TRACK_PERMISSIBLE_SPEED_KMPH = 110
 
 #: Thermovision hotspot escalation threshold on 25 kV OHE clamps (deg C).
 OHE_HOTSPOT_ALERT_C = 80.0
@@ -80,26 +84,15 @@ class SafetyInvariantError(ValueError):
 #  Time helpers
 # --------------------------------------------------------------------------- #
 def parse_time(value: Union[str, datetime, None], default_date: Optional[datetime] = None) -> datetime:
-    """Parse the time encodings used by CRIS / COA feeds into a ``datetime``."""
-    if isinstance(value, datetime):
-        return value
-    base = default_date or datetime.now()
-    if value is None or str(value).strip() == "":
-        return base
-    text = str(value).strip()
-    candidates = (
-        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M", "%H:%M:%S", "%H:%M",
-    )
-    for fmt in candidates:
-        try:
-            parsed = datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-        if "%Y" not in fmt:  # time-only -> pin to the planning date
-            parsed = parsed.replace(year=base.year, month=base.month, day=base.day)
-        return parsed
-    raise ValueError(f"unparseable time {value!r}")
+    """
+    Parse the time encodings used by CRIS / COA feeds into a ``datetime``.
+
+    Thin re-export of :func:`Backend.data_ingestion.permits.parse_timestamp` so
+    the block window is parsed by exactly one function - the one the permit
+    generator also uses. A time-only value (``"01:30"``) is pinned to
+    ``default_date``.
+    """
+    return permits.parse_timestamp(value, default_date=default_date)
 
 
 # --------------------------------------------------------------------------- #
@@ -118,48 +111,49 @@ def compute_earthing_window(
 
     Returns ISO-8601 timestamps plus the total possession minutes so the
     optimizer sees the *real* footprint on the corridor, not just the working
-    duration.
+    duration. The arithmetic itself lives on
+    :meth:`Backend.data_ingestion.permits.EarthingBuffer`, which *proves* it
+    holds (``work + 2 x 15`` and an ordered window) instead of merely computing
+    it - so a memo and a verdict can never disagree about the same possession.
     """
-    duration_mins = int(duration_mins)
-    start = parse_time(work_start)
-    buffer_mins = int(earthing_buffer_mins) if power_isolation_required else 0
+    return permits.build_earthing_buffer(
+        work_start,
+        int(duration_mins),
+        power_isolation_required,
+        buffer_mins=int(earthing_buffer_mins),
+    ).to_legacy_window()
 
-    earthing_start = start - timedelta(minutes=buffer_mins)
-    work_end = start + timedelta(minutes=duration_mins)
-    earthing_end = work_end + timedelta(minutes=buffer_mins)
-    total_mins = duration_mins + 2 * buffer_mins
 
-    return {
-        "statutory_reference": (
-            f"ACTM Vol II Para 204 ({buffer_mins}-minute discharge/earthing buffer)"
-            if buffer_mins else "ACTM Para 204 not applicable (no live OHE exposure)"
-        ),
-        "power_isolation_required": bool(power_isolation_required),
-        "earthing_buffer_mins": buffer_mins,
-        "earthing_applied": buffer_mins > 0,
-        "power_off_at": earthing_start.isoformat(),
-        "earthing_before": {
-            "from": earthing_start.isoformat(),
-            "to": start.isoformat(),
-            "minutes": buffer_mins,
-        },
-        "work_start": start.isoformat(),
-        "work_end": work_end.isoformat(),
-        "earthing_after": {
-            "from": work_end.isoformat(),
-            "to": earthing_end.isoformat(),
-            "minutes": buffer_mins,
-        },
-        "power_restored_at": earthing_end.isoformat(),
-        "work_duration_mins": duration_mins,
-        "total_possession_mins": total_mins,
-        "duration_with_buffer_expr": (
-            f"{duration_mins} + {buffer_mins} + {buffer_mins} = {total_mins} min "
-            f"(ACTM Para 204 earthing both sides)"
-            if buffer_mins
-            else f"{duration_mins} min (no live OHE exposure, ACTM Para 204 not applicable)"
-        ),
-    }
+# --------------------------------------------------------------------------- #
+#  Linear lookup helpers
+# --------------------------------------------------------------------------- #
+def _section_for_km_safe(km: Any) -> Optional[str]:
+    """
+    Sectional bookmark for a chainage, or ``None`` when it cannot be resolved.
+
+    A pure 1D lookup on the kilometre post - section codes are a reporting
+    convenience and play no part in deciding a collision.
+    """
+    try:
+        return waypoints.section_for_km(km)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read(row: Mapping[str, Any], *names: str, default: Any = None) -> Any:
+    """
+    First present value among ``names``.
+
+    Lets every invariant accept a :class:`BlockRequisition` dump (which carries
+    the canonical engineering-attribute names) *and* a legacy optimizer row
+    (which carries the pre-refactor spellings) without a field-name table per
+    check.
+    """
+    for name in names:
+        value = row.get(name)
+        if value is not None:
+            return value
+    return default
 
 
 # --------------------------------------------------------------------------- #
@@ -170,117 +164,36 @@ def generate_statutory_memos(
     window: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Auto-generate the statutory memos a block cannot start without.
+    The statutory instruments a requisition will attract, as plain dicts.
 
-    * ``T_351`` - IRSEM Para 22 disconnection notice (S&T gear isolated).
-    * ``T_352`` - IRSEM Para 22 reconnection notice (gear proved back in).
-    * ``ACTM_PTW`` - traction permit-to-work with the Para 204 earthing window.
-    * ``IRPWM_284_CAUTION`` - caution order for P-Way work under traffic.
+    Delegates to :func:`Backend.data_ingestion.permits.build_permits_for_requisition`,
+    which owns the prefill logic, so there is exactly one implementation of what
+    a Form T/351 or a Permit-to-Work contains.
+
+    The returned windows are **provisional**: no block has been allocated yet,
+    so the memo numbers and gear lists are indicative and every instrument comes
+    back ``PREFILLED`` and unsigned. For the real instruments, generate from the
+    scheduled block with ``permits.build_permits_for_block``.
+
+    Which instruments appear is *derived* - from the work type, the department
+    and the declared operating context - never read off a ``statutory_form``
+    field on the incoming row. A requisition cannot cite a memo that the
+    schedule has not yet created.
     """
-    dept = str(requisition.get("dept") or requisition.get("department") or "").upper()
-    asset_id = requisition.get("asset_id") or requisition.get("defect_id") or "UNKNOWN"
-    line = requisition.get("line") or requisition.get("track_id") or "UNKNOWN"
-    km_start = requisition.get("km_start")
-    km_end = requisition.get("km_end")
-    section = requisition.get("section") or waypoints.section_for_km(float(km_start))
-    power_required = bool(
-        requisition.get("requires_power_block") or dept in ("TRD", "ELECTRICAL_TRD", "ELECTRICAL")
-    )
-    disconnection_required = bool(requisition.get("requires_disconnection")) or dept in ("SNT", "S&T")
-    window = window or compute_earthing_window(
-        requisition.get("work_start"), int(requisition.get("duration_mins", 60)), power_required
-    )
-
-    memos: List[Dict[str, Any]] = []
-
-    if disconnection_required:
-        memos.append({
-            "form_no": IRSEM_DISCONNECTION_FORM,
-            "title": "Disconnection Notice (S&T gear)",
-            "statutory_reference": IRSEM_PARA_22_REFERENCE,
-            "issued_to": "Sectional Controller / Signal Maintainer",
-            "issued_for": asset_id,
-            "section": section,
-            "line": line,
-            "km_range": f"{km_start} - {km_end}",
-            "valid_from": window["work_start"],
-            "valid_to": window["work_end"],
-            "requirements": [
-                "Point machine / track circuit proved disconnected and clamped before work",
-                "Lever lock and disconnection collar applied; disconnection register entry made",
-                "No signal movement permitted until Form T/352 is issued",
-            ],
-            "status": "GENERATED",
-        })
-        memos.append({
-            "form_no": IRSEM_RECONNECTION_FORM,
-            "title": "Reconnection Notice (S&T gear proved in)",
-            "statutory_reference": IRSEM_PARA_22_REFERENCE,
-            "issued_to": "Sectional Controller / Signal Maintainer",
-            "issued_for": asset_id,
-            "section": section,
-            "line": line,
-            "km_range": f"{km_start} - {km_end}",
-            "valid_from": window["power_restored_at"],
-            "valid_to": None,
-            "requirements": [
-                "Insulation / earth test values recorded before reconnection",
-                "Point machine obstruction test repeated and proved",
-                "Track circuit occupancy test completed for the full section",
-            ],
-            "status": "GENERATED",
-        })
-
-    if power_required:
-        memos.append({
-            "form_no": "ACTM_PTW",
-            "title": "Traction Permit-To-Work with 25 kV earthing",
-            "statutory_reference": ACTM_PARA_203_REFERENCE,
-            "issued_to": "Traction Power Controller (TPC)",
-            "issued_for": asset_id,
-            "section": section,
-            "line": line,
-            "km_range": f"{km_start} - {km_end}",
-            "valid_from": window["power_off_at"],
-            "valid_to": window["power_restored_at"],
-            "requirements": [
-                ACTM_PARA_203_REFERENCE,
-                f"ACTM Para 204: {window['earthing_buffer_mins']} min discharge/earthing "
-                "buffer before AND after live work",
-                "Earthing rods applied at both ends of the isolated zone",
-                "TPC written confirmation of power off received before earthing",
-                "Section restored to traffic only after earthing removed and TPC informed",
-            ],
-            "earthing_window": {
-                "earthing_before": window["earthing_before"],
-                "work_window": {"from": window["work_start"], "to": window["work_end"]},
-                "earthing_after": window["earthing_after"],
-            },
-            "status": "GENERATED",
-        })
-
-    pway = bool(requisition.get("requires_traffic_block", True)) and dept in (
-        "CIVIL", "ENGINEERING", "ENGG", "PWAY", "P-WAY", "TRACK",
-    )
-    if pway:
-        memos.append({
-            "form_no": "IRPWM_284_CAUTION",
-            "title": "Caution Order for P-Way work under traffic",
-            "statutory_reference": IRPWM_PARA_284_REFERENCE,
-            "issued_to": "Loco Pilots / Guard (through NOTICE to Station Masters)",
-            "issued_for": asset_id,
-            "section": section,
-            "line": line,
-            "km_range": f"{km_start} - {km_end}",
-            "valid_from": window["work_start"],
-            "valid_to": window["work_end"],
-            "requirements": [
-                "Caution order issued to all affected drivers",
-                "Look-out man posted in both directions",
-                "Indication / banner flags placed 600 m on either approach as applicable",
-            ],
-            "status": "GENERATED",
-        })
+    builder = permits.build_permits_for_requisition(dict(requisition))
+    memos = [memo.to_legacy_memo_dict() for memo in builder.memos]
+    if window is not None:
+        # A caller that already computed the ACTM Para 204 window keeps it, so
+        # the verdict's earthing window and its memos stay on one timeline.
+        for memo in memos:
+            if memo["form_no"] == permits.FormCode.T_352.value:
+                memo["valid_from"] = window["power_restored_at"]
+            elif memo["form_no"] == permits.FormCode.ACTM_PTW.value:
+                memo["valid_from"] = window["power_off_at"]
+                memo["valid_to"] = window["power_restored_at"]
+            else:
+                memo["valid_from"] = window["work_start"]
+                memo["valid_to"] = window["work_end"]
     return memos
 
 
@@ -316,13 +229,33 @@ def evaluate_safety_invariants(requisition: Dict[str, Any]) -> Dict[str, Any]:
     dept_raw = req.get("dept") or req.get("department") or ""
     dept = str(dept_raw.value if hasattr(dept_raw, "value") else dept_raw).upper()
     asset_id = req.get("asset_id") or req.get("defect_id") or "UNKNOWN"
-    line = req.get("line") or req.get("track_id") or "UNKNOWN"
+    # The running line comes from the LRS field first, then the legacy optimiser
+    # spellings, and is bucketed as UNKNOWN (which collides conservatively)
+    # rather than being silently dropped.
+    line_id = lrs.line_id_of(req)
+    corridor_id = lrs.corridor_id_of(req)
+    line = line_id
     km_start = req.get("km_start")
     km_end = req.get("km_end")
-    duration = int(req.get("duration_mins") or 0)
+    # Both the new engineering-attribute name and the legacy optimizer spelling
+    # are accepted, so this engine can evaluate a contract dump or a legacy row.
+    duration = int(_read(req, "requested_duration_mins", "duration_mins", default=0) or 0)
 
     checks: List[Dict[str, Any]] = []
     violations: List[str] = []
+
+    # 0. LRS identity ------------------------------------------------------- #
+    line_ok = line_id in lrs.LINE_IDS
+    checks.append(_check(
+        "LRS_LINE_ID",
+        "Running line is one of the four quad lines on the LRS corridor",
+        line_ok,
+        f"line_id={line_id} on corridor_id={corridor_id}" if line_ok
+        else f"unresolvable running line {req.get('line_id') or req.get('line') or req.get('track_id')!r}; "
+        f"expected one of {list(lrs.LINE_IDS)}",
+    ))
+    if not line_ok:
+        violations.append("LRS_LINE_ID")
 
     # 1. Corridor boundary -------------------------------------------------- #
     inside = waypoints.validate_chainage(km_start) and waypoints.validate_chainage(km_end)
@@ -398,30 +331,51 @@ def evaluate_safety_invariants(requisition: Dict[str, Any]) -> Dict[str, Any]:
     if not buffer_ok:
         violations.append("ACTM_204_EARTHING_BUFFER")
 
-    # 5. IRSEM Para 22 Form T/351 ------------------------------------------- #
-    form = str(
-        (req.get("statutory_form").value if hasattr(req.get("statutory_form"), "value")
-         else req.get("statutory_form")) or ""
-    ).upper().replace("/", "_")
-    # The rule binds *disconnection jobs*, not every S&T requisition: an
-    # interlocking diagnostic or an LED signal swap touches no field gear.
-    snT_work = bool(req.get("requires_disconnection")) or form in ("T_351", "IRSEM_22", "T_352")
-    form_ok = (not snT_work) or form in ("T_351", "IRSEM_22", "T_352")
+    # 5. Permit requirements: DERIVED, never demanded (IRSEM Para 22) -------- #
+    # There is deliberately no rule here of the form "a disconnection job must
+    # cite Form T/351". A T/351 is a legal instrument a Sectional Controller
+    # issues *after* the block is authorised; a requisition arriving weeks ahead
+    # cannot hold one, so gating on it rejected conforming data and hid the real
+    # question. What the input owes us is enough engineering detail to raise the
+    # paperwork later - and for Form T/351 that means naming the gear.
+    permit_requirements = permits.derive_permit_requirements(req)
+    identified_gears = permits.collect_affected_gears(
+        [req], line_id, corridor_id, km_hint=km_start
+    )
+    gear_ok = not permits.requires_gear_identification(permit_requirements, identified_gears)
     checks.append(_check(
-        "IRSEM_22_T351_DISCONNECTION",
-        IRSEM_PARA_22_REFERENCE,
-        form_ok,
-        "Form T/351 disconnection notice referenced and auto-generated"
-        if snT_work and form_ok
-        else "not an S&T disconnection job"
-        if not snT_work
-        else f"S&T gear disconnection requires Form T/351 (received {form or 'none'})",
+        "DISCONNECTION_GEAR_IDENTIFIED",
+        "Work that puts signalling gear out of service must name the gear "
+        "(Form T/351 needs it; the notice itself is generated after scheduling)",
+        gear_ok,
+        f"gear identified for Form T/351: {', '.join(g.gear_id for g in identified_gears)}"
+        if permit_requirements.requires_disconnection and gear_ok
+        else "not a gear-disconnection job; no Form T/351 will be raised"
+        if not permit_requirements.requires_disconnection
+        else "gear disconnection required but no gear_id/point_no supplied: "
+        "Form T/351 cannot be prefilled with the affected gear",
     ))
-    if not form_ok:
-        violations.append("IRSEM_22_T351_DISCONNECTION")
+    if not gear_ok:
+        violations.append("DISCONNECTION_GEAR_IDENTIFIED")
+
+    checks.append(_check(
+        "PERMIT_REQUIREMENTS_DERIVED",
+        "Statutory instruments are derived from the engineering attributes and "
+        "generated downstream; none is required as an input",
+        True,
+        "will raise " + (
+            ", ".join(permit_requirements.forms) if permit_requirements.forms
+            else "no statutory instrument (no disconnection, isolation or caution order applies)"
+        ) + (
+            f"; silo cited {', '.join(f.value for f in permit_requirements.cited_forms)} (provenance only)"
+            if permit_requirements.cited_forms else ""
+        ),
+        severity=DEPARTMENT_SCALE_WARNING,
+        advisory=True,
+    ))
 
     # 6. IRPWM Para 268(b) speed restriction -------------------------------- #
-    psr = req.get("psr_speed_kmph")
+    psr = _read(req, "speed_restriction_psr", "psr_speed_kmph")
     psr_ok = True
     if psr is not None:
         try:
@@ -504,15 +458,26 @@ def evaluate_safety_invariants(requisition: Dict[str, Any]) -> Dict[str, Any]:
     verdict: Dict[str, Any] = {
         "asset_id": asset_id,
         "dept": dept,
+        # ---- LRS identity of the evaluated span ---------------------------- #
+        "corridor_id": corridor_id,
+        "line_id": line_id,
         "line": line,
         "km_start": km_start,
         "km_end": km_end,
-        "section": req.get("section") or waypoints.section_for_km(km_start),
+        "section": req.get("section") or _section_for_km_safe(km_start),
         "passed": passed,
         "status": "SAFE_TO_SCHEDULE" if passed else "BLOCKED_BY_SAFETY_INVARIANT",
         "violations": violations,
         "checks": checks,
         "earthing_window": window,
+        # ---- derived statutory requirements (the paper trail to come) ------ #
+        "permit_requirements": permit_requirements.model_dump(mode="json"),
+        "required_forms": permit_requirements.forms,
+        "referenced_form": (
+            permit_requirements.cited_forms[0].value if permit_requirements.cited_forms else None
+        ),
+        # Provisional instruments, so a reviewer can see exactly what will be
+        # raised once the block is scheduled. Always PREFILLED and unsigned.
         "statutory_forms_required": [m["form_no"] for m in generate_statutory_memos(req, window)],
         "memos": generate_statutory_memos(req, window),
     }
@@ -576,7 +541,7 @@ def possession_of(task: Dict[str, Any]) -> Dict[str, int]:
             "possession_mins": possession,
             "required_mins": work_mins + 2 * buffer_mins,
         }
-    work_mins = int(task.get("duration_mins") or 0)
+    work_mins = int(_read(task, "requested_duration_mins", "duration_mins", default=0) or 0)
     buffer_mins = ACTM_PARA_204_EARTHING_BUFFER_MINS if task.get("requires_power_block") else 0
     return {
         "work_mins": work_mins,
@@ -584,6 +549,45 @@ def possession_of(task: Dict[str, Any]) -> Dict[str, int]:
         "possession_mins": work_mins + 2 * buffer_mins,
         "required_mins": work_mins + 2 * buffer_mins,
     }
+
+
+def _lrs_span(block: Dict[str, Any], tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    1D chainage extent of a scheduled block.
+
+    Prefers the block's own ``corridor_id``/``line_id``/``km_start``/``km_end``
+    (written by the LRS-aware optimizer) and otherwise takes the union of its
+    bundled tasks - so a block dict that only ever carried ``section`` and
+    ``track_id`` can still be assessed in the chainage domain. Returns an empty
+    dict when no chainage is present at all, which the caller reports as an
+    unresolved-extent violation rather than silently waving the pair through.
+    """
+    line_raw = block.get("line_id") or block.get("track_id") or block.get("line")
+    corridor_raw = block.get("corridor_id") or block.get("corridor")
+    starts = [] if block.get("km_start") is None else [block["km_start"]]
+    ends = [] if block.get("km_end") is None else [block["km_end"]]
+
+    for task in tasks:
+        if task.get("km_start") is not None:
+            starts.append(task["km_start"])
+        if task.get("km_end") is not None:
+            ends.append(task["km_end"])
+        if line_raw is None:
+            line_raw = task.get("line_id") or task.get("track_id") or task.get("line")
+        if corridor_raw is None:
+            corridor_raw = task.get("corridor_id")
+
+    if not starts or not ends:
+        return {}
+    try:
+        return {
+            "corridor_id": lrs.coerce_corridor_id(corridor_raw),
+            "line_id": lrs.coerce_line_id(line_raw),
+            "km_start": min(lrs.coerce_km(value) for value in starts),
+            "km_end": max(lrs.coerce_km(value) for value in ends),
+        }
+    except (ValueError, TypeError):
+        return {}
 
 
 def validate_plan(blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -597,8 +601,12 @@ def validate_plan(blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
        earthing wrap** fits its corridor window. This is where a scheduler that
        budgets only the working duration is caught: the section is physically
        occupied for ``duration + 15 + 15`` minutes, not ``duration``.
-    2. Physical conflict exclusivity - no two possessions overlap in time on the
-       same section and running line.
+    2. **1D chainage exclusivity** - no two possessions whose kilometre
+       intervals collide on the same running line overlap in time. The test is
+       :func:`lrs.has_overlap` on ``(corridor_id, line_id, km_start, km_end)``.
+       Note what it deliberately does *not* say: two jobs in the same
+       ``section`` but different chainage are **not** a conflict, which is why
+       this guardrail is keyed on kilometre posts rather than on section codes.
     3. ACTM Para 204 arithmetic - the scheduled possession is at least
        ``max(work + 2 x buffer)`` over the bundled tasks, i.e. the earthing
        buffer of every job it wraps is actually paid for.
@@ -629,6 +637,8 @@ def validate_plan(blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
             "allocated_mins": allocated,
             "required_mins": max(m["required_mins"] for m in per_task),
             "buffer_mins": max(m["buffer_mins"] for m in per_task),
+            # The 1D extent the exclusivity invariant is evaluated on.
+            "span": _lrs_span(block, tasks),
         }
 
     for index, block in enumerate(blocks):
@@ -658,22 +668,59 @@ def validate_plan(blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not envelope_ok:
             violations.append(f"POWER_ISOLATION_ENVELOPE:{label}")
 
+    metrics_by_index = [_block_metrics(block) for block in blocks]
+
     for i in range(len(blocks)):
         for j in range(i + 1, len(blocks)):
             a, b = blocks[i], blocks[j]
-            if a.get("section") != b.get("section") or a.get("track_id") != b.get("track_id"):
-                continue
-            a_metrics, b_metrics = _block_metrics(a), _block_metrics(b)
-            overlap = a_metrics["start"] < b_metrics["end"] and b_metrics["start"] < a_metrics["end"]
+            a_metrics, b_metrics = metrics_by_index[i], metrics_by_index[j]
             label = f"{a.get('block_id')}~{b.get('block_id')}"
+
+            # Different corridor or different running line -> no 1D interaction
+            # is possible, so there is nothing for this pair to answer for.
+            if not a_metrics["span"] or not b_metrics["span"]:
+                checks.append(_check(
+                    "LRS_EXTENT_RESOLVED",
+                    "Every scheduled block resolves to a 1D chainage interval",
+                    False,
+                    f"{label}: block carries no corridor_id/line_id/km_start/km_end "
+                    "and none of its bundled tasks do either",
+                    severity=DEPARTMENT_SCALE_WARNING,
+                ))
+                violations.append(f"LRS_EXTENT_RESOLVED:{label}")
+                continue
+            if not lrs.same_line(a_metrics["span"], b_metrics["span"]):
+                continue
+
+            # 1D chainage collision: the whole of the spatial test.
+            shared_km = lrs.overlap_length_km(a_metrics["span"], b_metrics["span"])
+            time_overlap = (
+                a_metrics["start"] < b_metrics["end"]
+                and b_metrics["start"] < a_metrics["end"]
+            )
+            conflict = shared_km > 0.0 and time_overlap
+
+            a_span, b_span = a_metrics["span"], b_metrics["span"]
+            detail = (
+                f"{label}: {a_span['line_id']} km {a_span['km_start']}-{a_span['km_end']} vs "
+                f"km {b_span['km_start']}-{b_span['km_end']} -> "
+            )
+            if shared_km > 0.0 and time_overlap:
+                detail += f"CONFLICT over {shared_km:.3f} km in an overlapping time window"
+            elif shared_km > 0.0:
+                detail += f"{shared_km:.3f} km of shared chainage, disjoint in time"
+            else:
+                detail += f"disjoint chainage ({lrs.gap_km(a_span, b_span):.3f} km apart)"
+
             checks.append(_check(
-                "PHYSICAL_EXCLUSIVITY",
-                "No two possessions overlap on the same section and running line",
-                not overlap,
-                f"{label}: {'OVERLAP' if overlap else 'disjoint'}",
+                "CHAINAGE_INTERVAL_EXCLUSIVITY",
+                "No two possessions whose 1D chainage intervals collide on the same "
+                "running line occupy overlapping time windows",
+                not conflict,
+                detail,
             ))
-            if overlap:
-                violations.append(f"PHYSICAL_EXCLUSIVITY:{label}")
+            if conflict:
+                violations.append(f"CHAINAGE_INTERVAL_EXCLUSIVITY:{label}")
 
     return {
         "passed": not violations,
@@ -686,16 +733,29 @@ def validate_plan(blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":  # pragma: no cover - manual inspection helper
+    # An engineering requisition as a silo would submit it: what work, where,
+    # how long, how urgent. No form number - a memo cannot exist yet.
     sample = {
-        "asset_id": "TMS-ENG-1006", "dept": "CIVIL", "line": "DN_FAST",
-        "km_start": 19.4, "km_end": 21.2, "duration_mins": 180,
-        "severity": "CRITICAL", "psr_speed_kmph": 30,
+        "asset_id": "TMS-ENG-1006", "dept": "CIVIL", "line_id": "DN_FAST",
+        "km_start": 19.4, "km_end": 21.2, "requested_duration_mins": 180,
+        "work_type": "TRACK_TAMPING", "fault_code": "SD_INDEX_HIGH",
+        "urgency": "CRITICAL", "speed_restriction_psr": 30,
         "requires_power_block": True, "requires_traffic_block": True,
         "work_start": "01:30",
     }
     verdict = evaluate_safety_invariants(sample)
     print(f"Verdict      : {verdict['status']}")
     print(f"Earthing     : {verdict['earthing_window']['duration_with_buffer_expr']}")
-    print(f"Forms        : {verdict['statutory_forms_required']}")
+    print(f"Will raise   : {verdict['required_forms']}")
+    print(f"Cited on row : {verdict['referenced_form']} (provenance only)")
     for check in verdict["checks"]:
         print(f"  [{check['status']:13s}] {check['code']:32s} {check['detail']}")
+
+    from .permits import build_permits_for_requisition
+
+    permit = build_permits_for_requisition(sample)
+    print(f"\nPermit       : {permit.permit_id} [{permit.status.value}]")
+    print(f"Window       : {permit.window_start:%Y-%m-%d %H:%M} -> {permit.window_end:%Y-%m-%d %H:%M}")
+    print(f"Earthing     : {permit.earthing.arithmetic}")
+    print(f"Memos        : {permit.memo_index}")
+    print(f"To be signed : {permit.unsigned_authorities}")

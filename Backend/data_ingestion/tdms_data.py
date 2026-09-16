@@ -9,6 +9,16 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any
 from .tms_data import SECTIONS, TRACKS
 
+#: Coded fault classification TDMS attaches to each work type.
+FAULT_CODES = {
+    "OHE_CANTILEVER_OVERHAUL": "OHE_CANTI",
+    "CONTACT_WIRE_HOTSPOT": "OHE_HOTSPOT",
+    "NEUTRAL_SECTION_INSPECTION": "OHE_PTFE_WORN",
+    "OHE_HEIGHT_STAGGER_REC": "OHE_STAGGER",
+    "ISOLATOR_INTERRUPTER_TEST": "OHE_ISOLATOR",
+    "EARTHING_BOND_AUDIT": "OHE_EARTH_BOND",
+}
+
 TRD_TASKS = [
     {
         "type": "OHE_CANTILEVER_OVERHAUL",
@@ -97,6 +107,12 @@ def generate_tdms_defects(count: int = 20, seed: int = 44) -> List[Dict[str, Any
             "km_start": km_start,
             "km_end": km_end,
             "substation": f"TSS-{sec['code'][:3]}",
+            # Canonical engineering attributes (legacy spellings retained for the
+            # optimizer/ACI bridge).
+            "work_type": task_tmpl["type"],
+            "fault_code": FAULT_CODES[task_tmpl["type"]],
+            "requested_duration_mins": task_tmpl["base_duration_mins"],
+            "speed_restriction_psr": None,
             "defect_type": task_tmpl["type"],
             "description": task_tmpl["description"],
             "severity": task_tmpl["severity"],
@@ -145,8 +161,13 @@ if __name__ == "__main__":
     print("Sample record:", data[0])
 
     requisition = normalize_tdms_defect(data[0])
+    print(f"LRS span        : {requisition.to_lrs_dict()}")
+    requisition.project_display()
     print(
-        f"Normalised      : {requisition.asset_id} [{requisition.dept.value}] "
-        f"km {requisition.km_start}-{requisition.km_end} on {requisition.line.value}"
+        f"Feeding post    : "
+        f"{requisition.feeding_post or requisition.display_start.station_code}"
     )
-    print(f"Feeding post    : {requisition.feeding_post or requisition.geo_start.station_code}")
+    print(
+        f"Display only    : {requisition.display_start.coordinates} "
+        "[read-only projection, never a solver input]"
+    )

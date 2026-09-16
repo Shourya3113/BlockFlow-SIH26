@@ -1,38 +1,48 @@
 """
-waypoints.py - Western Railway (Churchgate - Virar) WGS84 Waypoint Database
+waypoints.py - Linear-to-GPS Projection Table (Churchgate - Virar)
 
-The authoritative spatial reference for the BlockFlow ingestion layer: the
-single source of truth used to snap statutory **kilometerage** (the km markers
-printed on every Indian Railways requisition) onto **WGS84 coordinates**.
+A **lookup table**, and nothing more. BlockFlow's spatial truth is the 1D Linear
+Referencing System in :mod:`Backend.data_ingestion.lrs` -
+``(corridor_id, line_id, km_start, km_end)``. This module exists only so that a
+frontend, a digital twin or a PM Gati Shakti export can render that chainage
+somewhere on a map.
+
+It is never read by the solver and never read by a validation invariant. No
+solver constraint may call into this module, because a possession's legality is
+a question about kilometre posts, not about latitude.
 
 Corridor
 --------
 *   Churchgate (CCG) -> Virar (VR), Western Railway, Mumbai Division.
-*   Statutory length **59.98 km**, **29 stations**, four running lines
+*   Statutory length **59.980 km**, **29 stations**, four running lines
     (UP FAST / UP SLOW / DN SLOW / DN FAST - quad track from Grant Road north).
 *   Chainage datum: km 0.000 = Churchgate station centre; km 59.980 = Virar.
 
-Why a 439-point database
-------------------------
+Why a 439-point table
+---------------------
 A railway requisition never carries latitude/longitude - it carries
-``KM_FROM``/``KM_TO``. To place a defect on the 3D twin, or to prove which
-feeding-post / isolator boundary a 25 kV possession falls inside, we need a
-deterministic map from chainage to coordinate. This module freezes that map:
+``KM_FROM``/``KM_TO``. To draw a defect on the 3D twin we need a deterministic
+projection from chainage to coordinate. This module freezes that projection:
 
 1.  The 29 station centres are the surveyed geodetic ground control.
 2.  ``cumulative_chainage`` walks the control polyline and applies the survey
     closure factor so the traverse closes on the statutory 59.980 km.
 3.  **439 waypoints** are then resampled at a uniform 136.9 m chainage pitch,
-    every one carrying its own ``km`` marker, nearest station and section.
+    every one carrying its own ``km`` marker.
 
-Because the resampling is closed-form, ``snap_km(21.35)`` is reproducible to
-the last decimal on every machine - which is what allows the ingestion layer to
-be audited rather than trusted, and what lets the jury re-derive any snapped
-coordinate by hand.
+Because the resampling is closed-form, ``project_km(21.35)`` is reproducible to
+the last decimal on every machine - which is what allows a rendered coordinate
+to be audited rather than trusted.
+
+The display payload is emitted as ``[lat, lon]`` (:func:`project_km`), matching
+the axis order the CesiumJS twin and the map components consume. The GeoJSON
+writers keep the RFC 7946 ``[lon, lat]`` order; both orders are explicit at the
+call site so neither can be silently transposed.
 """
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
+from .lrs import CORRIDOR_ID, CORRIDOR_LENGTH_KM
 from .spatial import (
     Point,
     TRACK_LATERAL_OFFSET_M,
@@ -51,19 +61,19 @@ from .spatial import (
 #  Corridor metadata
 # --------------------------------------------------------------------------- #
 CORRIDOR: Dict[str, object] = {
-    "corridor_id": "WR-MUMBAI-CCG-VR",
+    "corridor_id": CORRIDOR_ID,
     "name": "Churchgate - Virar",
     "zone": "Western Railway",
     "division": "Mumbai",
     "from_station": "CCG",
     "to_station": "VR",
-    "length_km": 59.98,
+    "length_km": CORRIDOR_LENGTH_KM,
     "station_count": 29,
     "track_count": 4,
     "tracks": ["UP_FAST", "UP_SLOW", "DN_SLOW", "DN_FAST"],
     "datum": "WGS84",
     "chainage_datum": "km 0.000 at Churchgate station centre",
-    "waypoint_pitch_km": round(59.98 / 438.0, 6),
+    "waypoint_pitch_km": round(CORRIDOR_LENGTH_KM / 438.0, 6),
 }
 
 #: Number of surveyed GPS waypoints in the database (400 m -> 136.9 m pitch).
@@ -130,7 +140,9 @@ FEEDING_POST_BOUNDARIES: List[Dict[str, object]] = [
     {"code": "FP-VR",  "substation": "TSS-VR",  "feeding_post": "VR",  "tracks": ["UP_FAST", "UP_SLOW", "DN_SLOW", "DN_FAST"]},
 ]
 
-CORRIDOR_LENGTH_KM = float(CORRIDOR["length_km"])
+# NOTE: ``CORRIDOR_LENGTH_KM`` (the LRS chainage bound) is defined in
+# :mod:`Backend.data_ingestion.lrs` and imported above - the geodesy below is
+# derived from the linear contract, never the other way round.
 
 
 # --------------------------------------------------------------------------- #
@@ -254,8 +266,9 @@ def waypoint_at_km(km: float) -> Dict[str, object]:
     """
     Interpolated (not rounded) WGS84 position of an exact chainage.
 
-    Use this when snapping a defect's ``km_start``/``km_end``; use
-    ``nearest_waypoint`` when you must cite an existing surveyed waypoint id.
+    A **projection-table lookup**, not a spatial authority: it answers "where do
+    I draw this kilometre post", never "does this possession collide with that
+    one" (that is :func:`Backend.data_ingestion.lrs.has_overlap`).
     """
     lon, lat = point_at_chainage(CENTERLINE, CENTERLINE_CHAINAGE, km)
     station = nearest_station(km)
@@ -296,6 +309,71 @@ def track_geometry(km: float, line: str, offset: Optional[float] = None) -> Dict
             )
         lon, lat = offset_point((lon, lat), brg, offset_m)
     return {"lon": round(lon, 6), "lat": round(lat, 6), "lateral_offset_m": offset_m}
+
+
+# --------------------------------------------------------------------------- #
+#  Read-only display projection (auxiliary rendering payload)
+# --------------------------------------------------------------------------- #
+def project_km(km: float, line_id: Optional[str] = None) -> Dict[str, object]:
+    """
+    Project a kilometre post onto the map as a read-only display payload.
+
+    Returns ``[lat, lon]`` (the axis order the CesiumJS twin consumes) plus the
+    chainage it was derived from, the lateral track offset and the section,
+    all of which are **decorative**: the authoritative identity of this point
+    remains ``(corridor_id, line_id, km)``. Pass ``line_id=None`` to project
+    onto the surveyed corridor centreline instead of a running line.
+
+    The projection is deterministic and closed-form, so a rendered coordinate
+    is reproducible from the chainage alone and can be audited by hand.
+    """
+    from .lrs import coerce_line_id
+
+    snapped = waypoint_at_km(km)
+    if line_id is None:
+        # No running line given: project onto the surveyed corridor centreline.
+        resolved_line: Optional[str] = None
+        geometry = track_geometry(km, "UP_FAST", offset=0.0)
+    else:
+        resolved_line = coerce_line_id(line_id)
+        geometry = track_geometry(km, resolved_line)
+    return {
+        "corridor_id": CORRIDOR_ID,
+        "line_id": resolved_line,
+        "km": snapped["km"],
+        "lat": geometry["lat"],
+        "lon": geometry["lon"],
+        "coordinates": [geometry["lat"], geometry["lon"]],  # [lat, lon]
+        "lateral_offset_m": geometry["lateral_offset_m"],
+        "section": snapped["section"],
+        "station_code": snapped["station_code"],
+        "station_km": snapped["station_km"],
+        "nearest_waypoint_id": snapped["nearest_waypoint_id"],
+        "projection_only": True,
+    }
+
+
+def project_span(span: Any) -> Dict[str, object]:
+    """
+    Display payload for a 1D span: its LRS identity plus both end coordinates.
+
+    Accepts a :class:`~Backend.data_ingestion.lrs.LinearSpan`, a
+    ``BlockRequisition`` or a legacy optimizer row. This is the *only* bridge
+    between the linear contract and geographic rendering - it flows strictly
+    outwards, and nothing reads a solver constraint back off it.
+    """
+    from .lrs import corridor_id_of, km_end_of, km_start_of, line_id_of
+
+    line_id = line_id_of(span)
+    return {
+        "corridor_id": corridor_id_of(span),
+        "line_id": line_id,
+        "km_start": km_start_of(span),
+        "km_end": km_end_of(span),
+        "start": project_km(km_start_of(span), line_id),
+        "end": project_km(km_end_of(span), line_id),
+        "projection_only": True,
+    }
 
 
 def feeding_post_for_km(km: float) -> Dict[str, object]:
