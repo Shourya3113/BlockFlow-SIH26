@@ -191,6 +191,23 @@ class IntegratedBlockOptimizer:
             A_rows.append(row)
             b_l.append(0.0)
             b_u.append(1.0)
+        # Constraint 2: Daily block capacity
+        # Limits the total number of maintenance blocks scheduled on each day.
+        for day_offset in range(horizon_days):
+            row = np.zeros(num_vars)
+            has_member = False
+
+            for b_idx, block in enumerate(candidate_blocks):
+                for s_idx, slot in enumerate(available_slots):
+                    if slot["day_offset"] == day_offset:
+                        row[b_idx * N_slots + s_idx] = 1.0
+                        has_member = True
+
+            if has_member:
+                A_rows.append(row)
+                b_l.append(0.0)
+                b_u.append(float(max_blocks_per_day))
+
 
         # Constraint 2: Each slot can host at most 1 block per section (no overlapping blocks in same slot/section)
         for s_idx in range(N_slots):
