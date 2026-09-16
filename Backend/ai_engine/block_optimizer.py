@@ -55,27 +55,51 @@ class IntegratedBlockOptimizer:
             # Group into bundles where departments coordinate
             depts_in_cluster = {t["department"] for t in cluster_tasks}
             
-            # Sort cluster by ACI descending
+            # Group into spatially compatible shadow bundles.
+            # A task can join a bundle only when:
+            # 1. It is on the same section + track (already enforced by spatial_clusters)
+            # 2. Its kilometer range overlaps the existing bundle
+            # 3. Its duration fits within the maximum 240-minute block window
             cluster_tasks.sort(key=lambda x: x["aci_score"], reverse=True)
 
-            # We create bundles of up to 4 tasks (e.g. 1 Engg + 1 S&T + 1 TRD)
             while cluster_tasks:
                 bundle = []
                 used_depts = set()
                 remaining = []
 
                 for t in cluster_tasks:
-                    # Prefer multi-department combinations
-                    if t["department"] not in used_depts or len(used_depts) == len(depts_in_cluster):
-                        # Add to current bundle if total duration fits in a standard window (<= 240 mins)
-                        bundle_duration = max([b["duration_mins"] for b in bundle] + [t["duration_mins"]])
-                        if bundle_duration <= 240:
-                            bundle.append(t)
-                            used_depts.add(t["department"])
-                        else:
-                            remaining.append(t)
+                    # Check spatial compatibility with every task already in
+                    # the current bundle.
+                    if bundle:
+                        bundle_km_start = min(float(b["km_start"]) for b in bundle)
+                        bundle_km_end = max(float(b["km_end"]) for b in bundle)
+
+                        spatially_compatible = (
+                                float(t["km_start"]) <= bundle_km_end
+                                and bundle_km_start <= float(t["km_end"])
+                        )
+                    else:
+                        spatially_compatible = True
+
+                    bundle_duration = max(
+                        [b["duration_mins"] for b in bundle]
+                        + [t["duration_mins"]]
+                    )
+
+                    # Allow at most one task per department in a shadow bundle.
+                    # This matches the intended 1 Engg + 1 S&T + 1 TRD design.
+                    department_available = t["department"] not in used_depts
+
+                    if (
+                        spatially_compatible
+                        and department_available
+                        and bundle_duration <= 240
+                    ):
+                        bundle.append(t)
+                        used_depts.add(t["department"])
                     else:
                         remaining.append(t)
+
 
                 cluster_tasks = remaining
                 if not bundle:
@@ -191,6 +215,23 @@ class IntegratedBlockOptimizer:
             A_rows.append(row)
             b_l.append(0.0)
             b_u.append(1.0)
+        # Constraint 2: Daily block capacity
+        # Limits the total number of maintenance blocks scheduled on each day.
+        for day_offset in range(horizon_days):
+            row = np.zeros(num_vars)
+            has_member = False
+
+            for b_idx, block in enumerate(candidate_blocks):
+                for s_idx, slot in enumerate(available_slots):
+                    if slot["day_offset"] == day_offset:
+                        row[b_idx * N_slots + s_idx] = 1.0
+                        has_member = True
+
+            if has_member:
+                A_rows.append(row)
+                b_l.append(0.0)
+                b_u.append(float(max_blocks_per_day))
+
 
         # Constraint 2: Each slot can host at most 1 block per section (no overlapping blocks in same slot/section)
         for s_idx in range(N_slots):
@@ -263,7 +304,16 @@ class IntegratedBlockOptimizer:
                             "downtime_saved_mins": block["saved_mins"],
                             "traffic_impact": traffic_info,
                             "approval_status": "PROPOSED",
-                            "ai_confidence_pct": round(92.0 + np.random.uniform(2.0, 7.0), 1)
+                            "ai_confidence_pct": round(
+                                min(
+                                    99.0,
+                                    88.0
+                                    + (block["max_aci_score"] * 0.08)
+                                    + (5.0 if block["is_joint_block"] else 0.0)
+                                    + (3.0 if block["duration_mins"] <= slot["duration_mins"] else 0.0)
+                                ),
+                                1
+                            )
                         }
                         scheduled_blocks.append(block_record)
 
