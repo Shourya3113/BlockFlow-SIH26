@@ -21,7 +21,7 @@ class ExecutionTelemetry:
         operation: str,
         input_summary: Optional[Dict[str, Any]] = None
     ) -> str:
-        trace_id = f"blockflow-exec-{uuid.uuid4().hex[:8]}"
+        trace_id = f"blockflow-exec-{uuid.uuid4().hex}"
 
         trace = {
             "trace_id": trace_id,

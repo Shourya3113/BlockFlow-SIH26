@@ -4,6 +4,7 @@ Provides RESTful APIs connecting the multi-department data layers, AI prioritiza
 SciPy HiGHS block optimizer, and the Chief Controller interactive frontend.
 """
 
+from .schemas.contracts import BlockActionRequest
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -69,11 +70,6 @@ def refresh_plans():
 # Initial plan generation
 refresh_plans()
 
-class BlockActionRequest(BaseModel):
-    block_id: str
-    action: str # "APPROVE", "REJECT", "OVERRIDE"
-    controller_id: str = "CHIEF_CTRL_MUMBAI"
-    reason: Optional[str] = "Optimal multi-department coordination verified."
 
 class SimulationRequest(BaseModel):
     block_id: str
@@ -380,6 +376,12 @@ def grant_block(req: BlockActionRequest):
             status_code=404,
             detail=f"Block {req.block_id} not found"
         )
+
+    if req.action != "APPROVE":
+            raise HTTPException(
+                status_code=400,
+                detail="Digital grant permit can only be issued for APPROVE action."
+    )
 
     trace_id = telemetry.start_trace(
         operation="DIGITAL_BLOCK_GRANT",

@@ -12,7 +12,7 @@ def generate_grant_permit(block, trace_id, controller_id):
 
     permit = {
         "permit_type": "DIGITAL_BLOCK_GRANT",
-"permit_id": f"PERMIT-{block['block_id']}-{trace_id}",
+        "permit_id": f"PERMIT-{block['block_id']}",
         "block_id": block["block_id"],
         "section": block["section"],
         "track_id": block["track_id"],
